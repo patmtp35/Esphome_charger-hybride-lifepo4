@@ -1,5 +1,7 @@
 # ⚡ Chargeur Hybride LiFePO₄ 24V – Victron + Emerson R48 + DPS5020 + ESP32 (ESPHome)
 
+# Il y a une version autonome qui se passe de HA pour faire le job 
+
 ## 📌 Description générale
 
 Ce projet permet de piloter un système de charge hybride pour batterie **LiFePO₄ 24V / 300Ah** en s'appuyant sur :
