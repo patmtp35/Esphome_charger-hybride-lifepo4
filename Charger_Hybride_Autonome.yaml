@@ -1,0 +1,1076 @@
+# ==========================================================
+#   PROJET : Chargeur hybride LiFePO₄ 24V 300Ah (Autonome + Blocage horaire)
+#   Chaîne : AC → Emerson/Vertiv R48 (48V) → DPS5020 → Batterie
+#   Auteur : Pat (+ optimisation assistée)
+#   Version : 1.6.5-autonome-timeblock - 2025-11-06
+#   ✅ Ajouts vs 1.6.3b :
+#     - Blocage automatique entre 21:30 et 06:00 (aucune dépendance Home Assistant)
+#     - Start_sequence protégé (anti-redémarrage, fenêtre mute 15 s)
+#     - Hystérésis retour secteur R48 (>215V ON / <185V OFF) + ignore fenêtre 12 s
+#     - Watchdogs alignés sur version 1.6.5 (Modbus/CAN/Temp/Surtension/Surintensité/WiFi)
+#     - Slew 0.30 V + init sur valeur réelle
+#     - Mode AUTONOME conservé (Shelly + phases internes)
+# ==========================================================
+
+substitutions:
+  device_description: "Chargeur 1.6.5-autonome LiFePO4 24V 300Ah via DPS5020 (Shelly + blocage horaire)"
+  limiter_name: limiter
+  tx_pin: GPIO17
+  rx_pin: GPIO16
+
+esphome:
+  name: charger-hybrid
+  friendly_name: "Chargeur 1.6.5 Autonome Emerson + DPS5020 (Shelly + Timeblock)"
+  min_version: 2024.6.0
+  comment: "R48 → DPS5020 (LiFePO4 24V), mode autonome Shelly, blocage 21:30–06:00"
+  on_boot:
+    priority: -100
+    then:
+      - delay: 2s
+      - logger.log: "⚡ ESP démarré – AC R48 volontairement éteint (sécurité)"
+      # 🔒 Blocage de démarrage si dans la fenêtre horaire 21:30–06:00
+      - if:
+          condition:
+            lambda: |-
+              auto t = id(esphome_time).now();
+              if (!t.is_valid()) return false; // si l'heure n'est pas encore valide, ne pas bloquer
+              bool after2130 = (t.hour > 21) || (t.hour == 21 && t.minute >= 30);
+              bool before0600 = (t.hour < 6);
+              return after2130 || before0600;
+          then:
+            - logger.log: "⏰ Fenêtre 21:30–06:00 → pas de start_sequence automatique au boot"
+          else:
+            - script.execute: start_sequence
+            - lambda: 'id(last_start_ts) = millis();'
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# ==========================================================
+# === LOGS
+# ==========================================================
+logger:
+  level: INFO
+  logs:
+    emerson_r48: WARN
+    mcp2515: INFO
+    lazy_limiter: INFO
+    limiter: INFO
+    component: INFO
+    dps: INFO
+
+api:
+  on_client_connected:
+    - lambda: |-
+        id(api_status) = true;
+        id(api_connected).publish_state(true);
+        ESP_LOGI("api", "✅ Home Assistant connecté");
+  on_client_disconnected:
+    - lambda: |-
+        id(api_status) = false;
+        id(api_connected).publish_state(false);
+        ESP_LOGI("api", "❌ Home Assistant déconnecté");
+
+ota:
+  platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+web_server:
+
+# ==========================================================
+# === HTTP REQUEST (Shelly polling)
+# ==========================================================
+http_request:
+  useragent: esphome/charger-hybrid
+  timeout: 2s
+  verify_ssl: false
+
+# ==========================================================
+# === EXTERNAL COMPONENTS
+# ==========================================================
+external_components:
+  - source:
+      type: git
+      url: https://github.com/jon7119/esphomeemerson-vertiv-r48
+      ref: main
+    refresh: 0s
+  - source: github://syssi/esphome-dps@main
+    refresh: 0s
+
+# ==========================================================
+# === EMERSON R48 (CANBUS)
+# ==========================================================
+spi:
+  id: shared_spi
+  clk_pin: GPIO18
+  mosi_pin: GPIO23
+  miso_pin: GPIO19
+
+canbus:
+  - platform: mcp2515
+    id: can
+    spi_id: shared_spi
+    use_extended_id: true
+    cs_pin: GPIO5
+    can_id: 0x0607FF83
+    bit_rate: 125kbps
+    clock: 8MHz   # module confirmé 8 MHz
+
+emerson_r48:
+  canbus_id: can
+  update_interval: 3s
+
+# Temps SNTP (utilisé pour la fenêtre horaire)
+time:
+  - platform: sntp
+    id: esphome_time
+    servers: pool.ntp.org
+
+button:
+  - platform: emerson_r48
+    set_offline_values:
+      name: "R48 Set offline values"
+
+  - platform: restart
+    name: "Restart ESP"
+    id: restart_esp
+
+# ==========================================================
+# === DPS5020 (UART + MODBUS)
+# ==========================================================
+uart:
+  id: uart_0
+  baud_rate: 9600
+  tx_pin: ${tx_pin}
+  rx_pin: ${rx_pin}
+
+modbus:
+  id: modbus0
+  uart_id: uart_0
+  send_wait_time: 50ms
+
+dps:
+  id: dps0
+  modbus_id: modbus0
+  update_interval: 5s
+
+lazy_limiter:
+  power_id: powermeter
+  power_sensor_inactivity_timeout: 20s
+  power_demand_calculation: NEGATIVE_MEASUREMENTS_REQUIRED
+  min_power_demand: 50
+  max_power_demand: 500
+  buffer: 30
+  update_interval: 3s
+
+# ==========================================================
+# === SCRIPTS (séquence de démarrage réutilisable + non-bloquants)
+# ==========================================================
+script:
+  - id: start_sequence
+    mode: queued
+    then:
+      # ✅ Sécurité : ne pas démarrer si dans la fenêtre horaire
+      - lambda: |-
+          auto t = id(esphome_time).now();
+          if (t.is_valid()) {
+            bool after2130 = (t.hour > 21) || (t.hour == 21 && t.minute >= 30);
+            bool before0600 = (t.hour < 6);
+            if (after2130 || before0600) {
+              ESP_LOGW("start", "⏰ 21:30–06:00 → start_sequence annulée (AC/DPS inchangés)");
+              return;
+            }
+          }
+      - logger.log: "⚡ Séquence de démarrage déclenchée"
+      # ⚡ AC R48 : cycle ON/OFF bref pour réinitialisation
+      - switch.turn_on: emerson_r48_ac_sw
+      - delay: 1s
+      - switch.turn_off: emerson_r48_ac_sw
+      - delay: 2s
+
+      # Vérif CAN R48
+      - wait_until:
+          condition:
+            lambda: 'return id(r48_output_voltage).has_state();'
+          timeout: 7s
+      - logger.log: "✅ CAN R48 OK"
+
+      # Réglages R48
+      - delay: 100ms
+      - number.set:
+          id: emerson_r48_output_voltage
+          value: 48.0
+      - number.set:
+          id: emerson_r48_max_output_current
+          value: 30
+      - number.set:
+          id: emerson_r48_max_input_current
+          value: 5
+      - logger.log: "⚙️ R48 réglé : 48V / 30% / 5A AC"
+
+      # Activer DC R48
+      - switch.turn_off: emerson_r48_dc_sw
+      - delay: 3s
+      - logger.log: "⚡ R48 → 48V envoyé vers DPS5020"
+
+      # Tension par défaut (sera pilotée par l'état interne ensuite)
+      - number.set:
+          id: voltage_setting
+          value: 27.0
+
+      # Activer DPS (autonome)
+      - switch.turn_on: dps_output_sw
+      - logger.log: "✅ Mode autonome : DPS ON"
+
+  # Précharge avant réactivation DC après DPS ON
+  - id: dc_rearm_after_dps_on
+    mode: restart
+    then:
+      - delay: 3s
+      - switch.turn_on: emerson_r48_dc_sw
+
+  # Reset court DC R48 (pour watchdog CAN inactif)
+  - id: r48_dc_reset_short
+    mode: restart
+    then:
+      - switch.turn_off: emerson_r48_dc_sw
+      - delay: 1s
+      - switch.turn_on: emerson_r48_dc_sw
+
+# ==========================================================
+# === BINARY SENSORS
+# ==========================================================
+binary_sensor:
+
+  - platform: template
+    id: api_connected
+    name: "API connectée"
+    device_class: connectivity
+    lambda: 'return id(api_status);'
+
+  - platform: status
+    name: "ESP Controller Status"
+
+  - platform: dps
+    output:
+      id: dps_output
+    key_lock:
+      id: dps_key_lock
+    constant_current_mode:
+      name: "DPS constant current mode"
+
+  - platform: template
+    id: charger_active
+    name: "Chargeur automatique actif"
+    device_class: power
+    lambda: |-
+      return id(current_setting).state > 0.5f && id(dps_output_sw).state;
+
+  # Détection retour secteur R48 avec hystérésis + temporisation
+  - platform: template
+    id: r48_ac_present
+    name: "R48 AC présent"
+    device_class: power
+    lambda: |-
+      // Hystérésis : ON >215 V, OFF <185 V
+      static bool ac = false;
+      if (!id(r48_ac_voltage).has_state()) return false;
+      float vac = id(r48_ac_voltage).state;
+      if (!ac && vac > 215.0f) ac = true;
+      if (ac && vac < 185.0f)  ac = false;
+      return ac;
+    filters:
+      - delayed_on: 3s
+      - delayed_off: 3s
+    on_press:
+      then:
+        - lambda: |-
+            // Ignorer si séquence tout juste exécutée (fenêtre 12 s)
+            if (millis() - id(last_start_ts) < 12000) {
+              ESP_LOGI("ac", "↩️ Retour AC ignoré (fenêtre mute post-sequence)");
+              return;
+            }
+            // Ne pas relancer si fenêtre horaire
+            auto t = id(esphome_time).now();
+            if (t.is_valid()) {
+              bool after2130 = (t.hour > 21) || (t.hour == 21 && t.minute >= 30);
+              bool before0600 = (t.hour < 6);
+              if (after2130 || before0600) {
+                ESP_LOGW("ac", "⏰ AC de retour mais blocage horaire → on ne relance pas");
+                return;
+              }
+            }
+            // Relancer seulement si surplus > 0
+            float surplus = id(powermeter).has_state() ? id(powermeter).state : 0.0f;
+            if (surplus <= 0.0f) {
+              ESP_LOGW("ac", "⚡ AC de retour mais pas de surplus → on ne relance pas");
+              return;
+            }
+            ESP_LOGI("ac", "⚡ Retour secteur stable détecté (>215 V) → start_sequence");
+            id(last_start_ts) = millis();
+        - script.execute: start_sequence
+
+# ==========================================================
+# === SENSORS (Emerson + Limiteur + DPS + Énergies)
+# ==========================================================
+sensor:
+  # --- Emerson R48 ---
+  - platform: emerson_r48
+    output_voltage:
+      name: "R48 Output voltage"
+      id: r48_output_voltage
+    output_current:
+      name: "R48 Output current"
+      id: r48_output_current
+    output_temp:
+      name: "R48 Temperature"
+      id: r48_output_temp
+    input_voltage:
+      name: "R48 AC Voltage"
+      id: r48_ac_voltage
+    max_output_current:
+      name: "R48 DC max current"
+      unit_of_measurement: "%"
+
+  # --- Puissance Emerson (entrée DPS5020) ---
+  - platform: template
+    name: "Puissance Emerson (entrée DPS)"
+    id: outpower
+    unit_of_measurement: "W"
+    device_class: power
+    update_interval: 6s
+    accuracy_decimals: 1
+    lambda: |-
+      if (!id(dps_output_sw).state) return 0.0f;
+      if (!id(r48_output_current).has_state() || !id(r48_output_voltage).has_state()) return 0.0f;
+      float i = id(r48_output_current).state;
+      if (i < 0.2f) return 0.0f; // seuil anti-bruit
+      return i * id(r48_output_voltage).state;
+
+  # --- Puissance (Shelly via HTTP) ---
+  - platform: template
+    id: powermeter
+    name: "Puissance Shelly (PV surplus)"
+    unit_of_measurement: "W"
+    device_class: power
+    accuracy_decimals: 1
+    update_interval: 1s
+    lambda: |-
+      float x = id(shelly_power_value);
+      static bool active = false;
+      static unsigned long on_since = 0;
+      static unsigned long off_since = 0;
+      const float ON_W = 30.0f;
+      const float OFF_W = 10.0f;
+      const uint32_t ON_MS = 3000;
+      const uint32_t OFF_MS = 5000;
+
+      if (x >= ON_W) {
+        if (on_since == 0) on_since = millis();
+        if (!active && (millis() - on_since >= ON_MS)) {
+          active = true;
+          ESP_LOGI("limiter", "⚡ Charge ON (%.1f W)", x);
+        }
+      } else {
+        on_since = 0;
+      }
+
+      if (x <= OFF_W) {
+        if (off_since == 0) off_since = millis();
+        if (active && (millis() - off_since >= OFF_MS)) {
+          active = false;
+          ESP_LOGI("limiter", "🛑 Charge OFF (%.1f W)", x);
+        }
+      } else {
+        off_since = 0;
+      }
+
+      return active ? x : 0.0f;
+
+  # --- Lazy limiter : demande de puissance → consigne courant ---
+  - platform: lazy_limiter
+    power_demand:
+      name: "${limiter_name} power demand"
+      on_value:
+      - lambda: |-
+          // Blocage horaire → consigne courant = 0
+          auto t = id(esphome_time).now();
+          if (t.is_valid()) {
+            bool after2130 = (t.hour > 21) || (t.hour == 21 && t.minute >= 30);
+            bool before0600 = (t.hour < 6);
+            if (after2130 || before0600) {
+              id(current_setting).make_call().set_value(0).perform();
+              ESP_LOGD("lazy_limiter", "⏸ 21:30–06:00 → consigne courant = 0");
+              return;
+            }
+          }
+
+          // Sécurisation tension pour conversion W→A
+          float v_meas = id(dps_output_voltage).has_state() ? id(dps_output_voltage).state : 0.0f;
+          float v_fallback = (id(dps_voltage_sensor).has_state() && id(dps_voltage_sensor).state > 1.0f) ? id(dps_voltage_sensor).state : 27.0f;
+          float v_use = (v_meas > 1.0f) ? v_meas : v_fallback;
+
+          float pd = x;
+          if (pd < 0) pd = 0;
+          if (pd > 500) pd = 500;
+
+          float amps = pd / v_use;
+          if (amps > 19.5f) amps = 19.5f;
+
+          id(current_setting).make_call().set_value(amps).perform();
+          ESP_LOGI("lazy_limiter", "⚙️ %.1f W → %.2f V → %.2f A", pd, v_use, amps);
+
+  # --- DPS5020 (mesures natives) ---
+  - platform: dps
+    output_voltage:
+      id: dps_output_voltage
+      name: "DPS output voltage"
+    output_current:
+      id: dps_output_current
+      name: "DPS output current"
+    output_power:
+      id: dps_output_power
+      name: "DPS output power"
+    input_voltage:
+      name: "DPS input voltage"
+    voltage_setting:
+      id: dps_voltage_sensor
+      name: "DPS voltage setting"
+    current_setting:
+      id: dps_current_sensor
+      name: "DPS current setting"
+    backlight_brightness:
+      name: "DPS backlight brightness"
+    firmware_version:
+      name: "DPS firmware version"
+
+  # --- Énergie DPS (entrée historique) ---
+  - platform: template
+    id: dps_energy_wh
+    name: "Énergie autoconsommée batterie (Wh)"
+    unit_of_measurement: "Wh"
+    accuracy_decimals: 1
+    icon: "mdi:battery-arrow-up-outline"
+
+  - platform: template
+    id: dps_energy_kwh
+    name: "Énergie autoconsommée batterie (kWh)"
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 3
+    icon: "mdi:battery-charging"
+    lambda: |-
+      return id(dps_energy_wh).state / 1000.0;
+
+  # --- Puissance batterie estimée (avec rendement DPS) ---
+  - platform: template
+    id: battery_power_est
+    name: "Puissance batterie estimée"
+    unit_of_measurement: "W"
+    device_class: power
+    accuracy_decimals: 1
+    update_interval: 6s
+    lambda: |-
+      const float efficiency = id(dps_efficiency).state / 100.0f;
+      if (!id(r48_output_current).has_state() || !id(r48_output_voltage).has_state()) return 0.0f;
+      if (!id(dps_output_sw).state) return 0.0f;
+      float p_in = id(r48_output_current).state * id(r48_output_voltage).state;
+      return p_in * efficiency;
+
+  # --- Énergie batterie estimée persistante ---
+  - platform: template
+    id: battery_energy_wh
+    name: "Énergie batterie estimée (Wh)"
+    unit_of_measurement: "Wh"
+    device_class: energy
+    accuracy_decimals: 1
+    update_interval: 10s
+    icon: "mdi:battery-arrow-up-outline"
+    lambda: |-
+      static unsigned long last_time = millis();
+      unsigned long now = millis();
+      if (now < last_time) last_time = now; // protection overflow millis
+      float delta_h = (now - last_time) / 3600000.0f;  # heures
+      last_time = now;
+
+      if (id(battery_power_est).has_state()) {
+        float p = id(battery_power_est).state;
+        if (p > 0.5f) {
+          id(battery_energy_wh_total) += p * delta_h;
+        }
+      }
+      # Publication explicite
+      id(battery_energy_wh).publish_state(id(battery_energy_wh_total));
+      return id(battery_energy_wh_total);
+
+  - platform: template
+    id: battery_energy_kwh
+    name: "Énergie batterie estimée (kWh)"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    accuracy_decimals: 3
+    icon: "mdi:battery-charging"
+    lambda: |-
+      float value = id(battery_energy_wh_total) / 1000.0;
+      id(battery_energy_kwh).publish_state(value);
+      return value;
+
+# ==========================================================
+# === TEXT SENSORS
+# ==========================================================
+text_sensor:
+  - platform: lazy_limiter
+    operation_mode:
+      name: "${limiter_name} operation mode"
+
+  - platform: dps
+    protection_status:
+      name: "DPS protection status"
+    device_model:
+      name: "DPS device model"
+
+  # Affichage "phase" (machine interne)
+  - platform: template
+    id: charge_phase_text
+    name: "Phase de charge batterie"
+
+  - platform: template
+    id: charge_phase_duration
+    name: "Durée charge active"
+
+# ==========================================================
+# === SWITCHES
+# ==========================================================
+switch:
+  - platform: emerson_r48
+    ac_sw:
+      name: "R48 AC switch STOP"
+      id: emerson_r48_ac_sw
+      restore_mode: ALWAYS_OFF
+    dc_sw:
+      name: "R48 DC switch STOP"
+      id: emerson_r48_dc_sw
+      restore_mode: ALWAYS_ON
+    fan_sw:
+      name: "R48 FAN switch MAX"
+      id: emerson_r48_fan_sw
+    led_sw:
+      name: "R48 LED switch"
+
+  - platform: lazy_limiter
+    manual_mode:
+      name: "${limiter_name} manual mode"
+    emergency_power_off:
+      name: "${limiter_name} emergency power off"
+
+  - platform: dps
+    output:
+      id: dps_output_sw
+      name: "DPS output"
+    key_lock:
+      id: dps_keylock_sw
+      name: "DPS key lock"
+
+  - platform: template
+    name: "RAZ durée charge active"
+    icon: "mdi:timer-refresh"
+    turn_on_action:
+      - globals.set:
+          id: phase_active_time
+          value: "0"
+      - logger.log: "🔁 Durée charge active remise à zéro"
+
+  - platform: template
+    name: "RAZ énergie batterie estimée"
+    icon: "mdi:counter-reset"
+    turn_on_action:
+      - lambda: |-
+          id(battery_energy_wh_total) = 0.0f;
+          id(battery_energy_wh).publish_state(0.0f);
+          id(battery_energy_kwh).publish_state(0.0f);
+          ESP_LOGI("energy", "🔄 Énergie batterie estimée remise à zéro");
+
+# ==========================================================
+# === NUMBERS (Emerson + Limiteur + DPS + Rendement)
+# ==========================================================
+number:
+  # --- Emerson R48 ---
+  - platform: emerson_r48
+    output_voltage:
+      name: "R48 Set output voltage"
+      id: emerson_r48_output_voltage
+    max_output_current:
+      name: "R48 Max output current"
+      id: emerson_r48_max_output_current
+      unit_of_measurement: "%"
+    max_input_current:
+      name: "R48 Max input current"
+      id: emerson_r48_max_input_current
+
+  # --- Lazy Limiter ---
+  - platform: lazy_limiter
+    manual_power_demand:
+      name: "${limiter_name} manual power demand"
+    max_power_demand:
+      name: "${limiter_name} max power demand"
+      initial_value: 500
+      restore_value: true
+
+  # --- DPS5020 ---
+  - platform: dps
+    voltage_setting:
+      id: voltage_setting
+      name: "${limiter_name} voltage setting"
+    current_setting:
+      id: current_setting
+      name: "${limiter_name} current setting"
+      min_value: 0
+      max_value: 19.5
+      step: 0.1
+
+  # --- Rendement DPS5020 ---
+  - platform: template
+    name: "Rendement DPS5020"
+    id: dps_efficiency
+    min_value: 70
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    optimistic: true
+    restore_value: true
+    initial_value: 93
+
+# ==========================================================
+# === GLOBALS (énergie persistante + timers simples + état)
+# ==========================================================
+globals:
+  - id: api_status
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: energy_wh
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+
+  - id: modbus_ready
+    type: bool
+    restore_value: no
+    initial_value: "true"
+
+  - id: battery_energy_wh_total
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+
+  # ⏱ Temps actif de charge (ne s'incrémente que si P > 10 W)
+  - id: phase_active_time
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+
+  # ⏱ Timestamp du dernier lancement de start_sequence (anti-doublon)
+  - id: last_start_ts
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+
+  # --- Valeur de puissance Shelly (HTTP) ---
+  - id: shelly_power_value
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  # --- Machine d'état de charge (0=IDLE,1=BULK,2=ABS,3=FLOAT)
+  - id: charge_state
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # --- Timestamp début de phase (ms)
+  - id: phase_start_ts
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+
+# ==========================================================
+# === LOGIQUE AUTONOME + WATCHDOGS
+# ==========================================================
+interval:
+  # 🌐 Shelly polling via HTTP (toutes les 1s)
+  - interval: 1s
+    then:
+      - http_request.get:
+          url: http://192.168.3.38/rpc/shelly.getstatus
+          on_response:
+            then:
+              - lambda: |-
+                  if (status_code == 200) {
+                    json::JsonObject root = json::parse(body);
+                    if (!root.isNull() && root.containsKey("em1:1")) {
+                      auto em = root["em1:1"];
+                      if (em.containsKey("act_power")) {
+                        id(shelly_power_value) = -em["act_power"].as<float>(); // surplus positif
+                      }
+                    }
+                  }
+
+  # 🧩 1) Surveillance Modbus DPS5020 — met à jour modbus_ready
+  - interval: 5s
+    then:
+      - lambda: |-
+          static float last_voltage = 0.0f;
+          if (id(dps_output_voltage).has_state()) {
+            float v = id(dps_output_voltage).state;
+            if (fabsf(v - last_voltage) > 0.05f) {
+              id(modbus_ready) = true;
+              last_voltage = v;
+            }
+          } else {
+            id(modbus_ready) = false;
+          }
+
+  # ⚡ 2) Machine d'état de charge autonome + pilotage tension/courant + énergie
+  - interval: 3s
+    then:
+      - lambda: |-
+          if (!id(modbus_ready)) return;
+
+          // ⏰ Si blocage horaire → arrêt propre et retour IDLE
+          {
+            auto t = id(esphome_time).now();
+            if (t.is_valid()) {
+              bool after2130 = (t.hour > 21) || (t.hour == 21 && t.minute >= 30);
+              bool before0600 = (t.hour < 6);
+              if (after2130 || before0600) {
+                if (id(dps_output_sw).state) id(dps_output_sw).turn_off();
+                if (id(emerson_r48_ac_sw).state) id(emerson_r48_ac_sw).turn_off();
+                if (id(charge_state) != 0) {
+                  id(charge_state) = 0;
+                  id(charge_phase_text).publish_state("Idle (fenêtre horaire)");
+                  id(phase_start_ts) = millis();
+                }
+                return; // rien d'autre pendant la fenêtre
+              }
+            }
+          }
+
+          // Surplus courant (capteur powermeter → W)
+          float surplus_w = 0.0f;
+          if (id(powermeter).has_state()) surplus_w = id(powermeter).state;
+
+          // Constantes de phases
+          const float V_BULK  = 28.4f;
+          const float V_ABS   = 28.4f;
+          const float V_FLOAT = 27.0f;
+
+          const float I_BULK_EXIT_A = 5.0f;   // fin bulk si courant < 5 A (stable)
+          const float I_ABS_EXIT_A  = 2.0f;   // fin absorption si courant < 2 A (stable)
+
+          const uint32_t BULK_MAX_MS = 2UL * 60UL * 60UL * 1000UL; // 2h max
+          const uint32_t ABS_MAX_MS  = 20UL * 60UL * 1000UL;       // 20 min
+
+          // Slew init
+          static bool v_init = false;
+          static float last_set_v = 27.0f;
+          if (!v_init) {
+            if (id(dps_output_voltage).has_state() && id(dps_output_voltage).state > 1.0f)
+              last_set_v = id(dps_output_voltage).state;
+            else if (id(dps_voltage_sensor).has_state() && id(dps_voltage_sensor).state > 1.0f)
+              last_set_v = id(dps_voltage_sensor).state;
+            v_init = true;
+          }
+
+          auto set_voltage_slewed = [&](float target_v){
+            float new_v = target_v;
+            if (fabsf(target_v - last_set_v) > 0.30f) {
+              new_v = (target_v > last_set_v) ? (last_set_v + 0.30f) : (last_set_v - 0.30f);
+            }
+            if (fabsf(new_v - last_set_v) > 0.05f) {
+              id(voltage_setting).make_call().set_value(new_v).perform();
+              ESP_LOGI("charge", "🔧 Vset=%.2f V (cible %.2f V)", new_v, target_v);
+              last_set_v = new_v;
+            }
+          };
+
+          // Helper: mise à jour texte phase et timer
+          auto set_phase = [&](int st, const char* name){
+            if (id(charge_state) != st) {
+              id(charge_state) = st;
+              id(phase_start_ts) = millis();
+              id(charge_phase_text).publish_state(name);
+              ESP_LOGI("charge", "➡️ Phase %s", name);
+            }
+          };
+
+          // Démarrage si surplus (capteur hysterésé)
+          if (id(charge_state) == 0) { // IDLE
+            if (surplus_w > 0.0f) {
+              // Armer AC + séquence démarrage (anti-doublon)
+              static unsigned long last_seq = 0;
+              if (millis() - last_seq > 15000) {
+                id(start_sequence).execute();
+                last_seq = millis();
+                id(last_start_ts) = millis();
+              }
+              set_phase(1, "Bulk");
+            } else {
+              // Pas de surplus → s'assurer coupure
+              if (id(dps_output_sw).state) id(dps_output_sw).turn_off();
+              if (id(emerson_r48_ac_sw).state) id(emerson_r48_ac_sw).turn_off();
+            }
+          }
+
+          // Mesures actuelles
+          float i_out = id(dps_output_current).has_state() ? id(dps_output_current).state : 0.0f;
+
+          // BULK
+          if (id(charge_state) == 1) {
+            set_voltage_slewed(V_BULK);
+            // Fin bulk si I < seuil 60s ou durée max
+            static unsigned long bulk_low_i_since = 0;
+            if (i_out < I_BULK_EXIT_A) {
+              if (bulk_low_i_since == 0) bulk_low_i_since = millis();
+            } else {
+              bulk_low_i_since = 0;
+            }
+            bool time_ok = (millis() - id(phase_start_ts) > BULK_MAX_MS);
+            bool current_ok = (bulk_low_i_since != 0 && (millis() - bulk_low_i_since > 60000));
+            if (time_ok || current_ok) {
+              set_phase(2, "Absorption");
+            }
+          }
+
+          // ABSORPTION
+          if (id(charge_state) == 2) {
+            set_voltage_slewed(V_ABS);
+            bool time_ok = (millis() - id(phase_start_ts) > ABS_MAX_MS);
+            static unsigned long abs_low_i_since = 0;
+            if (i_out < I_ABS_EXIT_A) {
+              if (abs_low_i_since == 0) abs_low_i_since = millis();
+            } else {
+              abs_low_i_since = 0;
+            }
+            bool current_ok = (abs_low_i_since != 0 && (millis() - abs_low_i_since > 60000));
+            if (time_ok || current_ok) {
+              set_phase(3, "Float");
+            }
+          }
+
+          # FLOAT
+          if (id(charge_state) == 3) {
+            set_voltage_slewed(V_FLOAT);
+            # Si plus de surplus pendant 60s → stop
+            static unsigned long no_surplus_since = 0;
+            if (surplus_w <= 0.0f) {
+              if (no_surplus_since == 0) no_surplus_since = millis();
+              if (millis() - no_surplus_since > 60000) {
+                id(dps_output_sw).turn_off();
+                id(emerson_r48_ac_sw).turn_off();
+                set_phase(0, "Idle");
+              }
+            } else {
+              no_surplus_since = 0;
+            }
+          }
+
+          # ⏱ Durée charge active (p_real > 10 W)
+          float p_real = id(dps_output_power).state;
+          static unsigned long last_t = millis();
+          unsigned long now = millis();
+          if (now < last_t) last_t = now; // overflow safe
+          unsigned long elapsed_s = (now - last_t) / 1000;
+          last_t = now;
+          if (id(dps_output_sw).state && p_real > 10.0f) {
+            id(phase_active_time) += elapsed_s;
+          }
+
+          # Affichage durée charge active (hh:mm:ss)
+          {
+            unsigned long elapsed = id(phase_active_time);
+            char buffer[24];
+            int hours = elapsed / 3600;
+            int minutes = (elapsed % 3600) / 60;
+            int seconds = elapsed % 60;
+            sprintf(buffer, "%02dh %02dm %02ds", hours, minutes, seconds);
+            id(charge_phase_duration).publish_state(buffer);
+          }
+
+          bool active = id(current_setting).state > 0.5f && id(dps_output_sw).state;
+          id(charger_active).publish_state(active);
+
+  # 🔌 3) Watchdog Modbus DPS5020
+  - interval: 10s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              static unsigned long last_dps = millis();
+              static float lv=0, li=0, lp=0;
+              bool ok = false;
+              if (id(dps_output_voltage).has_state() && fabsf(id(dps_output_voltage).state-lv) > 0.01f) { lv = id(dps_output_voltage).state; ok = true; }
+              if (id(dps_output_current).has_state() && fabsf(id(dps_output_current).state-li) > 0.02f) { li = id(dps_output_current).state; ok = true; }
+              if (id(dps_output_power).has_state() && fabsf(id(dps_output_power).state-lp) > 0.5f)     { lp = id(dps_output_power).state; ok = true; }
+              if (ok) last_dps = millis();
+              return (millis() - last_dps > 10000);
+          then:
+            - logger.log: "🧯 DPS Modbus bloqué >10s → reset"
+            - lambda: "id(modbus_ready) = false;"
+            - delay: 1s
+            - lambda: "id(modbus_ready) = true;"
+
+  # 📡 4) Watchdog Wi-Fi / API (reboot après 10 min)
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              static unsigned long last_seen = millis();
+              if (id(api_connected).state)
+                last_seen = millis();
+              return (millis() - last_seen > 600000);
+          then:
+            - logger.log: "❌ API absente depuis >10 min → reboot ESP"
+            - button.press: restart_esp
+
+  # 🔁 5) Watchdog CAN R48 (courant inactif) — ignore 15 s après boot
+  - interval: 2s
+    then:
+      - lambda: |-
+          if (millis() < 15000) return;
+          if (!id(dps_output_sw).state) return;
+          if (!id(emerson_r48_dc_sw).state) return;
+
+          static uint32_t last_seen = millis();
+          if (id(r48_output_current).has_state() && id(r48_output_current).state > 0.05f) {
+            last_seen = millis();
+            return;
+          }
+
+          static uint32_t last_reset = 0;
+          uint32_t now2 = millis();
+          if ((now2 - last_seen > 5000) && (now2 - last_reset > 30000)) {
+            ESP_LOGI("watchdog", "🔁 CAN R48 inactif → reset DC");
+            last_reset = now2;
+            id(r48_dc_reset_short).execute(); // non bloquant
+          }
+
+  # ⚙️ 6) Watchdog charge bloquée sans puissance
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              static unsigned long last_power = millis();
+              if (id(charger_active).state && id(dps_output_power).state > 20.0f)
+                last_power = millis();
+              return (id(charger_active).state && millis() - last_power > 60000);
+          then:
+            - logger.log: "⚠️ Charge bloquée sans puissance → restart DPS"
+            - switch.turn_off: dps_output_sw
+            - delay: 1s
+            - switch.turn_on: dps_output_sw
+            - logger.log: "✅ DPS ON (après blocage)"
+
+  # ⚡ 7) Watchdog surtension batterie (corrigé)
+  - interval: 2s
+    then:
+      - lambda: |-
+          static unsigned long overvolt_start = 0;
+          if (!id(dps_output_sw).state) { overvolt_start = 0; return; }
+
+          const float v = id(dps_output_voltage).state;
+          const float V_WARN   = 29.0f;
+          const float V_CUTOFF = 29.2f;
+          const uint32_t DELAY = 3000;
+
+          if (v > V_WARN) {
+            if (overvolt_start == 0) {
+              ESP_LOGI("watchdog", "⚠️ Surtension détectée (%.2f V)", v);
+              overvolt_start = millis();
+            }
+          } else {
+            overvolt_start = 0;
+          }
+
+          if (overvolt_start > 0 && v > V_CUTOFF && millis() - overvolt_start > DELAY) {
+            ESP_LOGW("watchdog", "🛑 Coupure surtension batterie !");
+            id(dps_output_sw).turn_off();
+            id(charge_phase_text).publish_state("⚠️ Coupure surtension batterie !");
+          }
+
+  # 🌡️ 8) Watchdog température Emerson
+  - interval: 5s
+    then:
+      - lambda: |-
+          if (!id(r48_output_temp).has_state()) return;
+          float t = id(r48_output_temp).state;
+          if (!(t > -20.0f && t < 90.0f)) return;
+
+          static bool fan_forced = false;
+          if (t >= 55.0f && t < 70.0f)
+            ESP_LOGI("watchdog", "🌡️ Température R48 élevée : %.1f°C", t);
+          if (t >= 60.0f && !fan_forced) {
+            id(emerson_r48_fan_sw).turn_on();
+            fan_forced = true;
+          }
+          if (t >= 70.0f) {
+            ESP_LOGW("watchdog", "🔥 SURCHAUFFE → DC OFF + DPS OFF");
+            id(emerson_r48_dc_sw).turn_off();
+            id(dps_output_sw).turn_off();
+            id(charge_phase_text).publish_state("⚠️ Coupure surchauffe Emerson !");
+          }
+          if (t <= 50.0f && fan_forced) {
+            id(emerson_r48_fan_sw).turn_off();
+            fan_forced = false;
+          }
+
+  # 🧯 9) DC OFF si DPS OFF (avec réarmement différé)
+  - interval: 2s
+    then:
+      - lambda: |-
+          static bool dc_cut = false;
+          if (!id(dps_output_sw).state && id(emerson_r48_dc_sw).state && !dc_cut) {
+            id(emerson_r48_dc_sw).turn_off();
+            dc_cut = true;
+          }
+          if (id(dps_output_sw).state && !id(emerson_r48_dc_sw).state && dc_cut) {
+            id(dc_rearm_after_dps_on).execute();
+            dc_cut = false;
+          }
+
+  # 🔋 10) Watchdog surintensité DPS5020 (reprise autonome)
+  - interval: 1s
+    then:
+      - lambda: |-
+          static bool overload = false;
+          static unsigned long start = 0, recover = 0;
+          float I = id(dps_output_current).state;
+
+          if (I >= 20.0f && I < 22.0f && !overload)
+            ESP_LOGI("watchdog", "⚠️ Courant élevé : %.2f A", I);
+
+          if (I >= 22.0f && !overload) {
+            if (start == 0) start = millis();
+            if (millis() - start > 2000) {
+              ESP_LOGW("watchdog", "🛑 SURINTENSITÉ → DPS OFF");
+              id(dps_output_sw).turn_off();
+              id(charge_phase_text).publish_state("⚠️ Coupure surintensité DPS !");
+              overload = true;
+            }
+          } else start = 0;
+
+          if (overload && I <= 5.0f) {
+            if (recover == 0) recover = millis();
+            if (millis() - recover > 3000) {
+              ESP_LOGI("watchdog", "✅ Reprise DPS, courant OK");
+              id(dps_output_sw).turn_on();
+              overload = false;
+              recover = 0;
+            }
+          } else recover = 0;

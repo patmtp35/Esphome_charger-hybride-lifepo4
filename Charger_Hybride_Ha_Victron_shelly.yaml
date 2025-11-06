@@ -1,0 +1,1107 @@
+# ==========================================================
+#   PROJET : Chargeur hybride LiFePO₄ 24V 300Ah (Optimisé Victron)
+#   Chaîne : AC → Emerson/Vertiv R48 (48V) → DPS5020 → Batterie
+#   Auteur : Pat (+ optimisation assistée)
+#   Version : 1.6.5 - 2025-11-05
+#   ✅ Modifié le 2025-11-05 – Ajout protections nuit + Victron OFF (AC ne redémarre plus automatiquement)
+#   Points clés :
+#     - Phases de charge déléguées au Victron (sensor.smartsolar1_esp_charging_mode) – source de vérité
+#     - Tensions LiFePO₄ Victron vs DPS : DPS = Victron - 0.20 V (evite les conflits de régulation)
+#       * Bulk/Absorption Victron 28.6 V → DPS 28.4 V
+#       * Float Victron 27.1 V → DPS 26.9 V
+#     - DPS activé UNIQUEMENT si Victron est OK (bulk/absorption/float)
+#     - Si Victron OFF/IDLE/NIGHT/FAULT → DPS OFF + R48 AC OFF
+#     - Transition OFF→ON du Victron → R48 AC ON + 2s + start_sequence (non bloquant via scripts)
+#     - Surveillances conservées (CAN/Modbus/Temp/Surtension/Surintensité/WiFi)
+#     - Debounce 2s + Slew 0.3V pour éviter les à-coups (init sur valeur réelle)
+#     - Ajout d'une commande pour forcer la charge meme si victron OFF
+#     - Modifi watchdog dps bloqué 
+#     - correction compteurs Wh et KWH
+#     - correction levé couché soleil
+# ==========================================================
+
+substitutions:
+  device_description: "Chargeur 1.6.5 LiFePO4 24V 300Ah via DPS5020 (piloté Victron)"
+  limiter_name: limiter
+  tx_pin: GPIO17
+  rx_pin: GPIO16
+
+esphome:
+  name: charger-hybrid
+  friendly_name: "Chargeur 1.6.5 Hybride Emerson + DPS5020 (Victron/shelly)"
+  min_version: 2024.6.0
+  comment: "R48 alimente le DPS5020 (charge LiFePO4 24V, mode piloté Victron, DPS -0.2V)"
+  on_boot:
+    priority: -100
+    then:
+      - delay: 2s
+      - logger.log: "⚡ ESP démarré – AC R48 volontairement éteint (sécurité)"
+      # ✅ Empêche l'autostart la nuit si Victron n'est pas OK (sauf mode forcé)
+      - if:
+          condition:
+            lambda: |-
+              std::string vm = id(victron_mode).state.c_str();
+              for (auto &c : vm) c = tolower(c);
+              bool victron_ok = (vm == "bulk" || vm == "absorption" || vm == "float");
+              if (id(sun_down).state && !victron_ok && !id(force_charge_mode)) {
+                ESP_LOGW("boot", "🌙 Nuit + Victron OFF → pas de start_sequence automatique au boot");
+                return false;
+              }
+              return (millis() - id(last_start_ts)) > 15000;
+          then:
+            - script.execute: start_sequence
+            - lambda: 'id(last_start_ts) = millis();'
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# ==========================================================
+# === LOGS
+# ==========================================================
+logger:
+  level: INFO
+  logs:
+    emerson_r48: WARN
+    mcp2515: INFO
+    lazy_limiter: INFO
+    limiter: INFO
+    component: INFO
+    dps: INFO
+
+api:
+  on_client_connected:
+    - lambda: |-
+        id(api_status) = true;
+        id(api_connected).publish_state(true);
+        ESP_LOGI("api", "✅ Home Assistant connecté");
+  on_client_disconnected:
+    - lambda: |-
+        id(api_status) = false;
+        id(api_connected).publish_state(false);
+        ESP_LOGI("api", "❌ Home Assistant déconnecté");
+
+ota:
+  platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+web_server:
+
+# ==========================================================
+# === EXTERNAL COMPONENTS
+# ==========================================================
+external_components:
+  - source:
+      type: git
+      url: https://github.com/jon7119/esphomeemerson-vertiv-r48
+      ref: main
+    refresh: 0s
+  - source: github://syssi/esphome-dps@main
+    refresh: 0s
+
+# ==========================================================
+# === EMERSON R48 (CANBUS)
+# ==========================================================
+spi:
+  id: shared_spi
+  clk_pin: GPIO18
+  mosi_pin: GPIO23
+  miso_pin: GPIO19
+
+canbus:
+  - platform: mcp2515
+    id: can
+    spi_id: shared_spi
+    use_extended_id: true
+    cs_pin: GPIO5
+    can_id: 0x0607FF83
+    bit_rate: 125kbps
+    clock: 8MHz   # module confirmé 8 MHz
+
+emerson_r48:
+  canbus_id: can
+  update_interval: 3s
+
+time:
+  - platform: sntp
+    id: esphome_time
+    servers: pool.ntp.org
+
+button:
+  - platform: emerson_r48
+    set_offline_values:
+      name: "R48 Set offline values"
+
+  - platform: restart
+    name: "Restart ESP"
+    id: restart_esp
+
+# ==========================================================
+# === DPS5020 (UART + MODBUS)
+# ==========================================================
+uart:
+  id: uart_0
+  baud_rate: 9600
+  tx_pin: ${tx_pin}
+  rx_pin: ${rx_pin}
+
+modbus:
+  id: modbus0
+  uart_id: uart_0
+  send_wait_time: 50ms
+
+dps:
+  id: dps0
+  modbus_id: modbus0
+  update_interval: 5s
+
+lazy_limiter:
+  power_id: powermeter
+  power_sensor_inactivity_timeout: 20s
+  power_demand_calculation: NEGATIVE_MEASUREMENTS_REQUIRED
+  min_power_demand: 50
+  max_power_demand: 500
+  buffer: 30
+  update_interval: 3s
+
+# ==========================================================
+# === SCRIPTS (séquence de démarrage réutilisable + non-bloquants)
+# ==========================================================
+script:
+  - id: start_sequence
+    mode: queued
+    then:
+      # ✅ Sécurité : ne pas démarrer si nuit + Victron OFF + pas en mode forcé
+      - lambda: |-
+          std::string vm = id(victron_mode).state.c_str();
+          for (auto &c : vm) c = tolower(c);
+          bool victron_ok = (vm == "bulk" || vm == "absorption" || vm == "float");
+
+          if (id(sun_down).state && !victron_ok && !id(force_charge_mode)) {
+            ESP_LOGW("start", "🌙 Nuit + Victron OFF → start_sequence annulée (AC/DPS inchangés)");
+            return;
+          }
+
+      - logger.log: "⚡ Séquence de démarrage déclenchée"
+      
+      # ⚡ AC R48 : cycle ON/OFF bref pour réinitialisation
+      - switch.turn_on: emerson_r48_ac_sw
+      - delay: 1s
+      - switch.turn_off: emerson_r48_ac_sw
+      - delay: 2s
+
+      # Vérif CAN R48
+      - wait_until:
+          condition:
+            lambda: 'return id(r48_output_voltage).has_state();'
+          timeout: 7s
+      - logger.log: "✅ CAN R48 OK"
+
+      # Réglages R48
+      - delay: 100ms
+      - number.set:
+          id: emerson_r48_output_voltage
+          value: 48.0
+      - number.set:
+          id: emerson_r48_max_output_current
+          value: 30
+      - number.set:
+          id: emerson_r48_max_input_current
+          value: 5
+      - logger.log: "⚙️ R48 réglé : 48V / 30% / 5A AC"
+
+      # Activer DC R48
+      - switch.turn_off: emerson_r48_dc_sw
+      - delay: 3s
+      - logger.log: "⚡ R48 → 48V envoyé vers DPS5020"
+
+      # Tension par défaut DPS (pilotée ensuite par Victron)
+      - number.set:
+          id: voltage_setting
+          value: 26.9
+      - logger.log: "🔋 Mode Victron : consigne DPS sera ajustée (DPS -0.2V)"
+
+      # ✅ Activer DPS uniquement si Victron OK
+      - if:
+          condition:
+            lambda: |-
+              std::string vm = id(victron_mode).state.c_str();
+              for (auto &c : vm) c = tolower(c);
+              return (vm == "bulk" || vm == "absorption" || vm == "float");
+          then:
+            - switch.turn_on: dps_output_sw
+            - logger.log: "✅ Victron OK → DPS ON"
+          else:
+            - logger.log: "⛔ Victron non prêt → DPS reste OFF"
+
+  # Transition automatique Victron OFF → ON (corrigée : respecte la nuit + non-forcé)
+  - id: seq_victron_ok
+    mode: restart
+    then:
+      - lambda: |-
+          std::string vm = id(victron_mode).state.c_str();
+          for (auto &c : vm) c = tolower(c);
+          bool victron_ok = (vm == "bulk" || vm == "absorption" || vm == "float");
+          if (id(sun_down).state && !victron_ok && !id(force_charge_mode)) {
+            ESP_LOGW("seq", "🌙 Nuit + Victron pas en charge → pas de rallumage AC via seq_victron_ok()");
+            return;
+          }
+      - switch.turn_on: emerson_r48_ac_sw
+      - delay: 2s
+      - script.execute: start_sequence
+
+  # Précharge avant réactivation DC après DPS ON
+  - id: dc_rearm_after_dps_on
+    mode: restart
+    then:
+      - delay: 3s
+      - switch.turn_on: emerson_r48_dc_sw
+
+  # Reset court DC R48 (pour watchdog CAN inactif)
+  - id: r48_dc_reset_short
+    mode: restart
+    then:
+      - switch.turn_off: emerson_r48_dc_sw
+      - delay: 1s
+      - switch.turn_on: emerson_r48_dc_sw
+
+
+# ==========================================================
+# === BINARY SENSORS
+# ==========================================================
+binary_sensor:
+
+  - platform: template
+    id: api_connected
+    name: "API connectée"
+    device_class: connectivity
+    lambda: 'return id(api_status);'
+
+  - platform: status
+    name: "ESP Controller Status"
+
+  - platform: dps
+    output:
+      id: dps_output
+    key_lock:
+      id: dps_key_lock
+    constant_current_mode:
+      name: "DPS constant current mode"
+
+  - platform: template
+    id: charger_active
+    name: "Chargeur automatique actif"
+    device_class: power
+    lambda: |-
+      return id(current_setting).state > 0.5f && id(dps_output_sw).state;
+
+  # Détection retour secteur R48 (AC Voltage > 200V) avec hystérésis via delays
+
+  - platform: template
+    id: r48_ac_present
+    name: "R48 AC présent"
+    device_class: power
+    lambda: |-
+      // Hystérésis : ON >215 V, OFF <185 V
+      static bool ac = false;
+      if (!id(r48_ac_voltage).has_state()) return false;
+      float vac = id(r48_ac_voltage).state;
+      if (!ac && vac > 215.0f) ac = true;
+      if (ac && vac < 185.0f)  ac = false;
+      return ac;
+    filters:
+      - delayed_on: 3s
+      - delayed_off: 3s
+    on_press:
+      then:
+        - lambda: |-
+            // Ne pas réagir si c’est nous qui venons de jouer avec l’AC (fenêtre 12 s)
+            if (millis() - id(last_start_ts) < 12000) {
+              ESP_LOGI("ac", "↩️ Retour AC ignoré (fenêtre mute post-sequence)");
+              return;
+            }
+            // Optionnel : ne relancer que si Victron est en mode charge
+            std::string vm = id(victron_mode).state.c_str();
+            for (auto &c : vm) c = tolower(c);
+            bool victron_ok = (vm == "bulk" || vm == "absorption" || vm == "float");
+            if (!victron_ok) {
+              ESP_LOGW("ac", "⚡ AC de retour mais Victron non prêt (%s) → on ne relance pas", vm.c_str());
+              return;
+            }
+            ESP_LOGI("ac", "⚡ Retour secteur stable détecté (>215 V) → start_sequence");
+            id(last_start_ts) = millis();
+        - script.execute: start_sequence
+
+# MODIFICATION – Capteur pour savoir si le soleil est couché
+
+  - platform: template
+    id: sun_down
+    name: "Soleil couché"
+    lambda: |-
+      if (!id(sun_state).has_state()) return false;        // MODIFICATION
+      return id(sun_state).state == "below_horizon";        // MODIFICATION
+
+
+# ==========================================================
+# === SENSORS (Emerson + Limiteur + DPS + Énergies)
+# ==========================================================
+sensor:
+  # --- Emerson R48 ---
+  - platform: emerson_r48
+    output_voltage:
+      name: "R48 Output voltage"
+      id: r48_output_voltage
+    output_current:
+      name: "R48 Output current"
+      id: r48_output_current
+    output_temp:
+      name: "R48 Temperature"
+      id: r48_output_temp
+    input_voltage:
+      name: "R48 AC Voltage"
+      id: r48_ac_voltage
+    max_output_current:
+      name: "R48 DC max current"
+      unit_of_measurement: "%"
+
+  # --- Puissance Emerson (entrée DPS5020) ---
+  - platform: template
+    name: "Puissance Emerson (entrée DPS)"
+    id: outpower
+    unit_of_measurement: "W"
+    device_class: power
+    update_interval: 6s
+    accuracy_decimals: 1
+    lambda: |-
+      if (!id(dps_output_sw).state) return 0.0f;
+      if (!id(r48_output_current).has_state() || !id(r48_output_voltage).has_state()) return 0.0f;
+      float i = id(r48_output_current).state;
+      if (i < 0.2f) return 0.0f; // seuil anti-bruit
+      return i * id(r48_output_voltage).state;
+
+  # --- Entrée Home Assistant : puissance instantanée msunpv (négative = surplus) ---
+  - platform: homeassistant
+    internal: true
+    id: powermeter
+    name: "DPS smartmeter instantaneous power"
+    entity_id: sensor.cptlinkyshe_power
+    filters:
+      - multiply: -1
+      - throttle_average: 1s
+      - lambda: |-
+          // Hystérésis + temporisation: ON si surplus >= 30W pendant 3s, OFF si <=10W pendant 5s
+          static bool active = false;
+          static unsigned long on_since = 0;
+          static unsigned long off_since = 0;
+          const float ON_W = 30.0f;
+          const float OFF_W = 10.0f;
+          const uint32_t ON_MS = 3000;
+          const uint32_t OFF_MS = 5000;
+
+          if (x >= ON_W) {
+            if (on_since == 0) on_since = millis();
+            if (!active && (millis() - on_since >= ON_MS)) {
+              active = true;
+              ESP_LOGI("limiter", "⚡ Charge ON (%.1f W)", x);
+            }
+          } else {
+            on_since = 0;
+          }
+
+          if (x <= OFF_W) {
+            if (off_since == 0) off_since = millis();
+            if (active && (millis() - off_since >= OFF_MS)) {
+              active = false;
+              ESP_LOGI("limiter", "🛑 Charge OFF (%.1f W)", x);
+            }
+          } else {
+            off_since = 0;
+          }
+
+          if (!active) x = 0.0;
+          return round(x * 100.0) / 100.0;
+
+  # --- Lazy limiter : demande de puissance → consigne courant ---
+  - platform: lazy_limiter
+    power_demand:
+      name: "${limiter_name} power demand"
+      on_value:
+        - lambda: |-
+            // ✅ Ne rien faire si DPS éteint ou Victron pas prêt
+            std::string vm = id(victron_mode).state.c_str();
+            for (auto &c : vm) c = tolower(c);
+            bool victron_ok = (vm == "bulk" || vm == "absorption" || vm == "float");
+            if (!victron_ok || !id(dps_output_sw).state) {
+              ESP_LOGD("lazy_limiter", "⏸ Limiter ignoré (Victron=%s, DPS=%d)", vm.c_str(), id(dps_output_sw).state);
+              id(current_setting).make_call().set_value(0).perform();  // optionnel : met à zéro
+              return;
+            }
+
+            // --- Sécurisation tension pour calcul courant
+            float v_meas = id(dps_output_voltage).has_state() ? id(dps_output_voltage).state : 0.0f;
+            float v_fallback = (id(dps_voltage_sensor).has_state() && id(dps_voltage_sensor).state > 1.0f) ? id(dps_voltage_sensor).state : 26.9f;
+            float v_use = (v_meas > 1.0f) ? v_meas : v_fallback;
+
+            // --- Puissance demandée (x du limiter)
+            float pd = x;
+            if (pd < 0) pd = 0;
+            if (pd > 500) pd = 500;
+
+            float amps = pd / v_use;
+            if (amps > 19.5f) amps = 19.5f;
+
+            id(current_setting).make_call().set_value(amps).perform();
+            ESP_LOGI("lazy_limiter", "⚙️ %.1f W -> %.2f V -> %.2f A", pd, v_use, amps);
+
+  # --- DPS5020 (mesures natives) ---
+  - platform: dps
+    output_voltage:
+      id: dps_output_voltage
+      name: "DPS output voltage"
+    output_current:
+      id: dps_output_current
+      name: "DPS output current"
+    output_power:
+      id: dps_output_power
+      name: "DPS output power"
+    input_voltage:
+      name: "DPS input voltage"
+    voltage_setting:
+      id: dps_voltage_sensor
+      name: "DPS voltage setting"
+    current_setting:
+      id: dps_current_sensor
+      name: "DPS current setting"
+    backlight_brightness:
+      name: "DPS backlight brightness"
+    firmware_version:
+      name: "DPS firmware version"
+
+  # --- Énergie DPS (entrée historique) ---
+  - platform: template
+    id: dps_energy_wh
+    name: "Énergie autoconsommée batterie (Wh)"
+    unit_of_measurement: "Wh"
+    accuracy_decimals: 1
+    icon: "mdi:battery-arrow-up-outline"
+
+  - platform: template
+    id: dps_energy_kwh
+    name: "Énergie autoconsommée batterie (kWh)"
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 3
+    icon: "mdi:battery-charging"
+    lambda: |-
+      return id(dps_energy_wh).state / 1000.0;
+
+  # --- Puissance batterie estimée (avec rendement DPS) ---
+  - platform: template
+    id: battery_power_est
+    name: "Puissance batterie estimée"
+    unit_of_measurement: "W"
+    device_class: power
+    accuracy_decimals: 1
+    update_interval: 6s
+    lambda: |-
+      const float efficiency = id(dps_efficiency).state / 100.0f;
+      if (!id(r48_output_current).has_state() || !id(r48_output_voltage).has_state()) return 0.0f;
+      if (!id(dps_output_sw).state) return 0.0f;
+      float p_in = id(r48_output_current).state * id(r48_output_voltage).state;
+      return p_in * efficiency;
+
+  # --- Énergie batterie estimée persistante ---
+  - platform: template
+    id: battery_energy_wh
+    name: "Énergie batterie estimée (Wh)"
+    unit_of_measurement: "Wh"
+    device_class: energy
+    accuracy_decimals: 1
+    update_interval: 10s
+    icon: "mdi:battery-arrow-up-outline"
+    lambda: |-
+      static unsigned long last_time = millis();
+      unsigned long now = millis();
+      if (now < last_time) last_time = now;
+      float delta_h = (now - last_time) / 3600000.0f;
+      last_time = now;
+
+      if (id(battery_power_est).has_state()) {
+        float p = id(battery_power_est).state;
+        if (p > 0.5f) {
+          id(battery_energy_wh_total) += p * delta_h;
+        }
+      }
+
+      // ✅ Publication systématique (même si 0W)
+      float result = id(battery_energy_wh_total);
+      id(battery_energy_wh).publish_state(result);
+      return result;
+
+
+  - platform: template
+    id: battery_energy_kwh
+    name: "Énergie batterie estimée (kWh)"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    accuracy_decimals: 3
+    icon: "mdi:battery-charging"
+    lambda: |-
+      float value = id(battery_energy_wh_total) / 1000.0;
+      id(battery_energy_kwh).publish_state(value);
+      return value;
+
+
+# ==========================================================
+# === TEXT SENSORS
+# ==========================================================
+text_sensor:
+  - platform: lazy_limiter
+    operation_mode:
+      name: "${limiter_name} operation mode"
+
+  - platform: dps
+    protection_status:
+      name: "DPS protection status"
+    device_model:
+      name: "DPS device model"
+
+  # Affichage "phase" = mode Victron
+  - platform: template
+    id: charge_phase_text
+    name: "Phase de charge batterie"
+
+  - platform: template
+    id: charge_phase_duration
+    name: "Durée charge active"
+
+  # Récupération du mode de charge Victron (source de vérité)
+  - platform: homeassistant
+    id: victron_mode
+    name: "Victron charging mode"
+    entity_id: sensor.smartsolar1_esp_charging_mode
+
+  # MODIFICATION — État du soleil depuis HA ("above_horizon" / "below_horizon")
+
+  - platform: homeassistant
+    id: sun_state
+    entity_id: sun.sun
+
+# ==========================================================
+# === SWITCHES
+# ==========================================================
+switch:
+
+  - platform: template
+    name: "⚠️ Forcer charge (Ignorer Victron)"
+    id: force_charge_switch
+    icon: "mdi:flash-alert"
+    turn_on_action:
+      - lambda: |-
+          id(force_charge_mode) = true;
+          ESP_LOGW("force", "⚠️ Mode Forcé ACTIVÉ – DPS et R48 peuvent démarrer sans Victron !");
+      - switch.turn_on: emerson_r48_ac_sw
+      - delay: 2s
+      - script.execute: start_sequence
+
+    turn_off_action:
+      - lambda: |-
+          id(force_charge_mode) = false;
+          ESP_LOGI("force", "✅ Mode Forcé désactivé – Retour au contrôle Victron");
+
+  - platform: emerson_r48
+    ac_sw:
+      name: "R48 AC switch STOP"
+      id: emerson_r48_ac_sw
+      restore_mode: RESTORE_DEFAULT_OFF   # ou supprimer totalement la ligne
+    dc_sw:
+      name: "R48 DC switch STOP"
+      id: emerson_r48_dc_sw
+      restore_mode: ALWAYS_ON
+    fan_sw:
+      name: "R48 FAN switch MAX"
+      id: emerson_r48_fan_sw
+    led_sw:
+      name: "R48 LED switch"
+
+  - platform: lazy_limiter
+    manual_mode:
+      name: "${limiter_name} manual mode"
+      restore_mode: RESTORE_DEFAULT_OFF
+    emergency_power_off:
+      name: "${limiter_name} emergency power off"
+
+  - platform: dps
+    output:
+      id: dps_output_sw
+      name: "DPS output"
+    key_lock:
+      id: dps_keylock_sw
+      name: "DPS key lock"
+
+  - platform: template
+    name: "RAZ durée charge active"
+    icon: "mdi:timer-refresh"
+    turn_on_action:
+      - globals.set:
+          id: phase_active_time
+          value: "0"
+      - logger.log: "🔁 Durée charge active remise à zéro"
+      - if:
+          condition:
+            lambda: |-
+              std::string vm = id(victron_mode).state.c_str();
+              for (auto &c : vm) c = tolower(c);
+              return (vm == "bulk" || vm == "absorption" || vm == "float");
+          then:
+            - switch.turn_on: dps_output_sw
+            - logger.log: "✅ Victron OK → DPS ON (après RAZ)"
+          else:
+            - logger.log: "⛔ Victron non prêt → DPS OFF (après RAZ)"
+
+  - platform: template
+    name: "RAZ énergie batterie estimée"
+    icon: "mdi:counter-reset"
+    turn_on_action:
+      - lambda: |-
+          id(battery_energy_wh_total) = 0.0f;
+          id(battery_energy_wh).publish_state(0.0f);
+          id(battery_energy_kwh).publish_state(0.0f);
+          ESP_LOGI("energy", "🔄 Énergie batterie estimée remise à zéro");
+
+# ==========================================================
+# === NUMBERS (Emerson + Limiteur + DPS + Rendement)
+# ==========================================================
+number:
+  # --- Emerson R48 ---
+  - platform: emerson_r48
+    output_voltage:
+      name: "R48 Set output voltage"
+      id: emerson_r48_output_voltage
+    max_output_current:
+      name: "R48 Max output current"
+      id: emerson_r48_max_output_current
+      unit_of_measurement: "%"
+    max_input_current:
+      name: "R48 Max input current"
+      id: emerson_r48_max_input_current
+
+  # --- Lazy Limiter ---
+  - platform: lazy_limiter
+    manual_power_demand:
+      name: "${limiter_name} manual power demand"
+    max_power_demand:
+      name: "${limiter_name} max power demand"
+      initial_value: 500
+      restore_value: true
+
+  # --- DPS5020 ---
+  - platform: dps
+    voltage_setting:
+      id: voltage_setting
+      name: "${limiter_name} voltage setting"
+    current_setting:
+      id: current_setting
+      name: "${limiter_name} current setting"
+      min_value: 0
+      max_value: 19.5
+      step: 0.1
+
+  # --- Rendement DPS5020 ---
+  - platform: template
+    name: "Rendement DPS5020"
+    id: dps_efficiency
+    min_value: 70
+    max_value: 100
+    step: 1
+    unit_of_measurement: "%"
+    optimistic: true
+    restore_value: true
+    initial_value: 93
+
+# ==========================================================
+# === GLOBALS (énergie persistante + timers simples)
+# ==========================================================
+globals:
+
+  - id: force_charge_mode
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: api_status
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: energy_wh
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+
+  - id: modbus_ready
+    type: bool
+    restore_value: no
+    initial_value: "true"
+
+  - id: battery_energy_wh_total
+    type: float
+    restore_value: yes
+    initial_value: "0.0"
+
+  # ⏱ Temps actif de charge (ne s'incrémente que si P > 10 W)
+  - id: phase_active_time
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+
+  # ⏱ Timestamp du dernier lancement de start_sequence (anti-doublon)
+  - id: last_start_ts
+    type: unsigned long
+    restore_value: no
+    initial_value: "0"
+
+# ==========================================================
+# === LOGIQUE VICRON + WATCHDOGS
+# ==========================================================
+interval:
+  # 🧩 1) Surveillance Modbus DPS5020
+  - interval: 5s
+    then:
+      - lambda: |-
+          static float last_voltage = 0.0f;
+          if (id(dps_output_voltage).has_state()) {
+            float v = id(dps_output_voltage).state;
+            if (fabsf(v - last_voltage) > 0.05f) {
+              id(modbus_ready) = true;
+              last_voltage = v;
+            }
+          } else {
+            id(modbus_ready) = false;
+          }
+
+  # ⚡ 2) Pilotage tension DPS + gestion Victron/R48/DPS
+  - interval: 3s
+    then:
+      - lambda: |-
+          if (!id(modbus_ready)) return;
+
+          // --- Mode Victron
+          std::string mode_raw = id(victron_mode).state.c_str();
+          std::string mode = mode_raw;
+          for (auto &c : mode) c = tolower(c);
+
+          static std::string last_mode_seen = "";
+          static unsigned long mode_since = millis();
+          if (mode != last_mode_seen) {
+            last_mode_seen = mode;
+            mode_since = millis();
+          }
+          bool stable = (millis() - mode_since >= 2000);
+
+          bool victron_ok = (mode == "bulk" || mode == "absorption" || mode == "float");
+          static bool victron_ok_prev = false;
+
+          // Ne couper AC que si pas en mode forcé et pas d’action manuelle
+          if (id(sun_down).state && !id(force_charge_mode)) {
+            if (!id(emerson_r48_ac_sw).state) {
+              ESP_LOGW("victron", "🌙 Nuit + Victron OFF → AC coupé (STOP ON)");
+              id(emerson_r48_ac_sw).turn_on();
+            }
+          }
+
+          // --- Victron OFF -> ON (si jour ou mode forcé)
+          if (victron_ok && stable && !victron_ok_prev) {
+            ESP_LOGI("victron", "✅ Victron OK (%s) → start_sequence", mode_raw.c_str());
+            id(seq_victron_ok).execute();
+          }
+          victron_ok_prev = victron_ok;
+
+          // --- Choix tension cible
+          const float V_BULK   = 28.4f;
+          const float V_ABS    = 28.4f;
+          const float V_FLOAT  = 26.9f;
+          const float V_IDLE   = 27.1f;
+
+          static bool v_init = false;
+          static float last_set_v = 0.0f;
+          if (!v_init) {
+            if (id(dps_output_voltage).has_state() && id(dps_output_voltage).state > 1.0f)
+              last_set_v = id(dps_output_voltage).state;
+            else if (id(dps_voltage_sensor).has_state() && id(dps_voltage_sensor).state > 1.0f)
+              last_set_v = id(dps_voltage_sensor).state;
+            else
+              last_set_v = 26.9f;
+            v_init = true;
+          }
+
+          float target_v = V_FLOAT;
+          if      (mode == "bulk")       target_v = V_BULK;
+          else if (mode == "absorption") target_v = V_ABS;
+          else if (mode == "float")      target_v = V_FLOAT;
+          else if (mode == "off" || mode == "idle" || mode == "night" || mode == "fault") target_v = V_IDLE;
+
+          float new_set_v = target_v;
+          if (fabsf(target_v - last_set_v) > 0.30f)
+            new_set_v = (target_v > last_set_v) ? last_set_v + 0.30f : last_set_v - 0.30f;
+
+          if (fabsf(new_set_v - last_set_v) > 0.05f) {
+            id(voltage_setting).make_call().set_value(new_set_v).perform();
+            ESP_LOGI("victron", "🔧 Victron=%s → Vset=%.2f (cible %.2f)", mode_raw.c_str(), new_set_v, target_v);
+            last_set_v = new_set_v;
+          }
+
+          // --- Activer DPS seulement si Victron OK
+          if (!id(dps_output_sw).state && victron_ok && stable) {
+            ESP_LOGI("victron", "✅ Victron OK → Activation DPS");
+            id(dps_output_sw).turn_on();
+          }
+
+          // --- Mesure énergie + temps actif
+          float v = id(dps_output_voltage).state;
+          float a = id(dps_output_current).state;
+          float power = v * a;
+
+          static unsigned long last_t = millis();
+          unsigned long now = millis();
+          if (now < last_t) last_t = now;
+          float delta_h = (now - last_t) / 3600000.0f;
+          unsigned long elapsed_s = (now - last_t) / 1000;
+          last_t = now;
+
+          id(energy_wh) += power * delta_h;
+          id(dps_energy_wh).publish_state(id(energy_wh));
+
+          if (id(dps_output_sw).state && id(dps_output_power).state > 10.0f)
+            id(phase_active_time) += elapsed_s;
+
+          char buf[64];
+          snprintf(buf, sizeof(buf), "Victron : %s", mode_raw.c_str());
+          id(charge_phase_text).publish_state(buf);
+
+          unsigned long t = id(phase_active_time);
+          char buff[24];
+          sprintf(buff, "%02dh %02dm %02ds", t / 3600, (t % 3600) / 60, t % 60);
+          id(charge_phase_duration).publish_state(buff);
+
+  # 🔌 3) Watchdog Modbus DPS5020
+  - interval: 10s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              static unsigned long last_dps = millis();
+              static float lv=0, li=0, lp=0;
+              bool ok = false;
+              if (id(dps_output_voltage).has_state() && fabsf(id(dps_output_voltage).state-lv) > 0.01f) { lv = id(dps_output_voltage).state; ok = true; }
+              if (id(dps_output_current).has_state() && fabsf(id(dps_output_current).state-li) > 0.02f) { li = id(dps_output_current).state; ok = true; }
+              if (id(dps_output_power).has_state() && fabsf(id(dps_output_power).state-lp) > 0.5f)     { lp = id(dps_output_power).state; ok = true; }
+              if (ok) last_dps = millis();
+              return (millis() - last_dps > 10000);
+          then:
+            - logger.log: "🧯 DPS Modbus bloqué >10s → reset"
+            - lambda: "id(modbus_ready) = false;"
+            - delay: 1s
+            - lambda: "id(modbus_ready) = true;"
+
+  # 📡 4) Watchdog Wi-Fi / API
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              static unsigned long last_seen = millis();
+              if (id(api_connected).state)
+                last_seen = millis();
+              return (millis() - last_seen > 600000);
+          then:
+            - logger.log: "❌ API absente >10 min → reboot ESP"
+            - button.press: restart_esp
+
+  # 🔁 5) Watchdog CAN R48 (corrigé : ignore 15s après boot)
+  - interval: 2s
+    then:
+      - lambda: |-
+          if (millis() < 15000) return;
+          if (!id(dps_output_sw).state) return;
+          if (!id(emerson_r48_dc_sw).state) return;
+
+          static uint32_t last_seen = millis();
+          if (id(r48_output_current).has_state() && id(r48_output_current).state > 0.05f) {
+            last_seen = millis();
+            return;
+          }
+
+          static uint32_t last_reset = 0;
+          uint32_t now = millis();
+          if ((now - last_seen > 5000) && (now - last_reset > 30000)) {
+            ESP_LOGI("watchdog", "🔁 CAN R48 inactif → reset DC");
+            last_reset = now;
+            id(r48_dc_reset_short).execute();
+          }
+
+  # ⚙️ 6) Watchdog charge bloquée
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              static unsigned long last_power = millis();
+              if (id(charger_active).state && id(dps_output_power).state > 20.0f)
+                last_power = millis();
+              return (id(charger_active).state && millis() - last_power > 60000);
+          then:
+            - logger.log: "⚠️ Charge bloquée sans puissance → restart DPS"
+            - switch.turn_off: dps_output_sw
+            - delay: 1s
+            - if:
+                condition:
+                  lambda: |-
+                    std::string vm = id(victron_mode).state.c_str();
+                    for (auto &c : vm) c = tolower(c);
+                    return (vm == "bulk" || vm == "absorption" || vm == "float");
+                then:
+                  - switch.turn_on: dps_output_sw
+                  - logger.log: "✅ Victron OK → DPS relancé"
+                else:
+                  - logger.log: "⛔ Victron non prêt → DPS reste OFF"
+
+  # ⚡ 7) Watchdog surtension batterie (corrigé)
+  - interval: 2s
+    then:
+      - lambda: |-
+          static unsigned long overvolt_start = 0;
+          if (!id(dps_output_sw).state) { overvolt_start = 0; return; }
+
+          const float v = id(dps_output_voltage).state;
+          const float V_WARN   = 29.0f;
+          const float V_CUTOFF = 29.2f;
+          const uint32_t DELAY = 3000;
+
+          if (v > V_WARN) {
+            if (overvolt_start == 0) {
+              ESP_LOGI("watchdog", "⚠️ Surtension détectée (%.2f V)", v);
+              overvolt_start = millis();
+            }
+          } else {
+            overvolt_start = 0;
+          }
+
+          if (overvolt_start > 0 && v > V_CUTOFF && millis() - overvolt_start > DELAY) {
+            ESP_LOGW("watchdog", "🛑 Coupure surtension batterie !");
+            id(dps_output_sw).turn_off();
+            id(charge_phase_text).publish_state("⚠️ Coupure surtension batterie !");
+          }
+
+  # 🌡️ 8) Watchdog température Emerson
+  - interval: 5s
+    then:
+      - lambda: |-
+          if (!id(r48_output_temp).has_state()) return;
+          float t = id(r48_output_temp).state;
+          if (!(t > -20.0f && t < 90.0f)) return;
+
+          static bool fan_forced = false;
+          if (t >= 55.0f && t < 70.0f)
+            ESP_LOGI("watchdog", "🌡️ Température R48 élevée : %.1f°C", t);
+          if (t >= 60.0f && !fan_forced) {
+            id(emerson_r48_fan_sw).turn_on();
+            fan_forced = true;
+          }
+          if (t >= 70.0f) {
+            ESP_LOGW("watchdog", "🔥 SURCHAUFFE → DC OFF + DPS OFF");
+            id(emerson_r48_dc_sw).turn_off();
+            id(dps_output_sw).turn_off();
+            id(charge_phase_text).publish_state("⚠️ Coupure surchauffe Emerson !");
+          }
+          if (t <= 50.0f && fan_forced) {
+            id(emerson_r48_fan_sw).turn_off();
+            fan_forced = false;
+          }
+
+  # 🧯 9) DC OFF si DPS OFF
+  - interval: 2s
+    then:
+      - lambda: |-
+          static bool dc_cut = false;
+          if (!id(dps_output_sw).state && id(emerson_r48_dc_sw).state && !dc_cut) {
+            id(emerson_r48_dc_sw).turn_off();
+            dc_cut = true;
+          }
+          if (id(dps_output_sw).state && !id(emerson_r48_dc_sw).state && dc_cut) {
+            id(dc_rearm_after_dps_on).execute();
+            dc_cut = false;
+          }
+
+  # 🔋 10) Watchdog surintensité DPS5020
+  - interval: 1s
+    then:
+      - lambda: |-
+          static bool overload = false;
+          static unsigned long start = 0, recover = 0;
+          float I = id(dps_output_current).state;
+
+          if (I >= 20.0f && I < 22.0f && !overload)
+            ESP_LOGI("watchdog", "⚠️ Courant élevé : %.2f A", I);
+
+          if (I >= 22.0f && !overload) {
+            if (start == 0) start = millis();
+            if (millis() - start > 2000) {
+              ESP_LOGW("watchdog", "🛑 SURINTENSITÉ → DPS OFF");
+              id(dps_output_sw).turn_off();
+              id(charge_phase_text).publish_state("⚠️ Coupure surintensité DPS !");
+              overload = true;
+            }
+          } else start = 0;
+
+          if (overload && I <= 5.0f) {
+            if (recover == 0) recover = millis();
+            if (millis() - recover > 3000) {
+              std::string vm = id(victron_mode).state.c_str();
+              for (auto &c : vm) c = tolower(c);
+              bool ok = (vm == "bulk" || vm == "absorption" || vm == "float");
+              if (ok) {
+                ESP_LOGI("watchdog", "✅ Reprise DPS, courant OK");
+                id(dps_output_sw).turn_on();
+              }
+              overload = false;
+              recover = 0;
+            }
+          } else recover = 0;
+
+  # 🧯 11) Watchdog démarrage DPS échoué
+  - interval: 10s
+    then:
+      - lambda: |-
+          static int retry = 0;
+          static int freezes = 0;
+          std::string vm = id(victron_mode).state.c_str();
+          for (auto &c : vm) c = tolower(c);
+          bool victron_ok = (vm == "bulk" || vm == "absorption" || vm == "float");
+
+          if (victron_ok && !id(dps_output_sw).state && !id(force_charge_mode)) {
+            retry++;
+            ESP_LOGW("watchdog", "⚠ DPS non actif (tentative %d)", retry);
+          } else retry = 0;
+
+          if (retry > 3) {
+            freezes++;
+            ESP_LOGE("watchdog", "🧯 DPS figé → reset Modbus/DC (cycle %d)", freezes);
+            id(dps_output_sw).turn_off();
+            id(emerson_r48_dc_sw).turn_off();
+            id(modbus_ready) = false;
+            retry = 0;
+          }
+
+          if (freezes >= 3) {
+            ESP_LOGE("watchdog", "⛔ Abandon → Intervention humaine requise !");
+            id(force_charge_mode) = false;
+            id(emerson_r48_ac_sw).turn_off();
+            id(dps_output_sw).turn_off();
+            freezes = 0;
+          }
+
+          if (id(dps_output_sw).state) freezes = 0;
