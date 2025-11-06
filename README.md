@@ -7,6 +7,7 @@ Ce projet permet de piloter un système de charge hybride pour batterie **LiFePO
 - Une alimentation **Emerson/Vertiv R48** (48V) pilotée via **CANBUS**,
 - Un convertisseur **DPS5020** contrôlé via **Modbus UART**,
 - Un **ESP32** sous **ESPHome**, connecté à Home Assistant.
+- NE PAS OUBLIER DE MONTER UNE DIODE MOSFET ENTRE LE + du DPS5020 ET Le + DE LA BATTERIE
 
 🎯 **Objectif :** exploiter le surplus photovoltaïque et automatiser la charge de la batterie tout en garantissant la sécurité, l'efficacité et la compatibilité avec Victron.
 
