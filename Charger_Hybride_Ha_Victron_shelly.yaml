@@ -18,6 +18,7 @@
 #     - Modifi watchdog dps bloqué 
 #     - correction compteurs Wh et KWH
 #     - correction levé couché soleil
+#     - conf réseau
 # ==========================================================
 
 substitutions:
@@ -25,6 +26,11 @@ substitutions:
   limiter_name: limiter
   tx_pin: GPIO17
   rx_pin: GPIO16
+  ota_pswd: !secret ota_pswd
+  ap_pwd: !secret ota_pswd
+  adress_ip: !secret ip_R48dps
+  gateway_ip: !secret ip_gateway
+  dns_ip: !secret ip_dns
 
 esphome:
   name: charger-hybrid
@@ -85,9 +91,29 @@ api:
 ota:
   platform: esphome
 
+# WiFi Component: https://esphome.io/components/wifi.html
+## ---------------------------------------------------
+## WIFI Settings 2 wifis
+## ---------------------------------------------------
 wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
+  networks:
+      ## domotique
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+      priority: 0
+      ### maison
+    - ssid: !secret wifi_ssid2
+      password: !secret wifi_password2
+      priority: 1
+  manual_ip:
+    static_ip: ${adress_ip}
+    gateway: ${gateway_ip}
+    subnet: 255.255.255.0    
+    dns1: ${dns_ip}
+  #domain: !secret domain
+  ap:
+    # ssid (Optional, string): The name of the access point to create. Leave empty to use the device name.
+    password: !secret ota_pswd
 
 web_server:
 
