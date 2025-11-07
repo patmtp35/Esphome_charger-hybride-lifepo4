@@ -10,7 +10,7 @@ Ce projet permet de piloter un système de charge hybride pour batterie **LiFePO
 - Un convertisseur **DPS5020** contrôlé via **Modbus UART**,
 - Un **ESP32** sous **ESPHome**, connecté à Home Assistant.
 - CECI EST UN MONTAGE AVEC MES PARAMETTRES CHACUN EST LIBRE DE L ADAPTER
-- ATTENTION RISQUES DE COURS CIRCUIT FAIRE LES CONNECTION BATTERIES ISOLES 
+- ATTENTION RISQUES DE COURS CIRCUITS FAIRE LES CONNECTIONS BATTERIES ISOLES 
 
 🎯 **Objectif :** exploiter le surplus photovoltaïque et automatiser la charge de la batterie tout en garantissant la sécurité, l'efficacité et la compatibilité avec Victron.
 
