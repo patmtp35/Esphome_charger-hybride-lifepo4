@@ -2,6 +2,8 @@
 
 # Il y a une version autonome qui se passe de HA pour faire le job 
 
+# Attention penssé a monter un Disjoncteur DC 12v-24v-48v 63A entre le DPS5020 et la batterie
+
 ## 📌 Description générale
 
 Ce projet permet de piloter un système de charge hybride pour batterie **LiFePO₄ 24V / 300Ah** en s'appuyant sur :
