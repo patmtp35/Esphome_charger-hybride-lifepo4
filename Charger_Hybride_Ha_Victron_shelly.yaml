@@ -573,6 +573,7 @@ sensor:
     name: "Énergie batterie estimée (kWh)"
     unit_of_measurement: "kWh"
     device_class: energy
+    state_class: total_increasing
     accuracy_decimals: 3
     icon: "mdi:battery-charging"
     lambda: |-
