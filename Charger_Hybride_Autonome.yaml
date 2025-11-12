@@ -494,7 +494,7 @@ sensor:
       static unsigned long last_time = millis();
       unsigned long now = millis();
       if (now < last_time) last_time = now; // protection overflow millis
-      float delta_h = (now - last_time) / 3600000.0f;  # heures
+      float delta_h = (now - last_time) / 3600000.0f;  // heures
       last_time = now;
 
       if (id(battery_power_est).has_state()) {
@@ -503,7 +503,7 @@ sensor:
           id(battery_energy_wh_total) += p * delta_h;
         }
       }
-      # Publication explicite
+      // Publication explicite
       id(battery_energy_wh).publish_state(id(battery_energy_wh_total));
       return id(battery_energy_wh_total);
 
@@ -862,10 +862,10 @@ interval:
             }
           }
 
-          # FLOAT
+          // FLOAT
           if (id(charge_state) == 3) {
             set_voltage_slewed(V_FLOAT);
-            # Si plus de surplus pendant 60s → stop
+            // Si plus de surplus pendant 60s → stop
             static unsigned long no_surplus_since = 0;
             if (surplus_w <= 0.0f) {
               if (no_surplus_since == 0) no_surplus_since = millis();
@@ -879,7 +879,7 @@ interval:
             }
           }
 
-          # ⏱ Durée charge active (p_real > 10 W)
+          // ⏱ Durée charge active (p_real > 10 W)
           float p_real = id(dps_output_power).state;
           static unsigned long last_t = millis();
           unsigned long now = millis();
@@ -890,7 +890,7 @@ interval:
             id(phase_active_time) += elapsed_s;
           }
 
-          # Affichage durée charge active (hh:mm:ss)
+          // Affichage durée charge active (hh:mm:ss)
           {
             unsigned long elapsed = id(phase_active_time);
             char buffer[24];
