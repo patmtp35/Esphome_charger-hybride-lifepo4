@@ -2,7 +2,7 @@
 #   PROJET : Chargeur hybride LiFePO₄ 24V 300Ah (Autonome + Blocage horaire)
 #   Chaîne : AC → Emerson/Vertiv R48 (48V) → DPS5020 → Batterie
 #   Auteur : Pat (+ optimisation assistée)
-#   Version : 1.6.5-autonome-timeblock - 2025-11-06
+#   Version : 1.6.6-autonome-timeblock - 2025-11-12
 #   ✅ Ajouts vs 1.6.3b :
 #     - Blocage automatique entre 21:30 et 06:00 (aucune dépendance Home Assistant)
 #     - Start_sequence protégé (anti-redémarrage, fenêtre mute 15 s)
@@ -10,6 +10,8 @@
 #     - Watchdogs alignés sur version 1.6.5 (Modbus/CAN/Temp/Surtension/Surintensité/WiFi)
 #     - Slew 0.30 V + init sur valeur réelle
 #     - Mode AUTONOME conservé (Shelly + phases internes)
+#  ✅ Ajouts vs 1.6.6 
+#     - refonte interogation shelly local      
 # ==========================================================
 
 substitutions:
@@ -20,9 +22,9 @@ substitutions:
 
 esphome:
   name: charger-hybrid
-  friendly_name: "Chargeur 1.6.5 Autonome Emerson + DPS5020 (Shelly + Timeblock)"
+  friendly_name: "Chargeur 1.6.6 Autonome Emerson + DPS5020 (Shelly + Timeblock)"
   min_version: 2024.6.0
-  comment: "R48 → DPS5020 (LiFePO4 24V), mode autonome Shelly, blocage 21:30–06:00"
+  comment: "R48 → DPS5020 (LiFePO4 24V), mode autonome Shelly "
   on_boot:
     priority: -100
     then:
@@ -172,6 +174,27 @@ lazy_limiter:
 # === SCRIPTS (séquence de démarrage réutilisable + non-bloquants)
 # ==========================================================
 script:
+
+  - id: get_shelly_status
+    mode: restart
+    then:
+      - http_request.get:
+          url: http://192.168.3.38/rpc/shelly.getstatus
+          on_response:
+            then:
+              - lambda: |-
+                  if (body.empty()) return;
+                  auto doc = json::parse_json(body);
+                  if (doc.isNull()) return;
+
+                  JsonObject root = doc.as<JsonObject>();
+                  if (root["em1:1"].is<JsonObject>()) {
+                    float val = root["em1:1"]["act_power"] | 0.0;
+                    // Inversion possible si besoin Shelly renvoie négatif en injection PV
+                    // val = -val;
+                    id(shelly_power_value) = val;
+                    ESP_LOGD("shelly", "Puissance Shelly EM = %.1f W", val);
+                  }  
   - id: start_sequence
     mode: queued
     then:
@@ -352,45 +375,17 @@ sensor:
       if (i < 0.2f) return 0.0f; // seuil anti-bruit
       return i * id(r48_output_voltage).state;
 
-  # --- Puissance (Shelly via HTTP) ---
+  # --- Shelly EM1:1 (surplus PV mesuré) ---
   - platform: template
-    id: powermeter
     name: "Puissance Shelly (PV surplus)"
+    id: powermeter
     unit_of_measurement: "W"
     device_class: power
     accuracy_decimals: 1
-    update_interval: 1s
+    update_interval: 5s
     lambda: |-
-      float x = id(shelly_power_value);
-      static bool active = false;
-      static unsigned long on_since = 0;
-      static unsigned long off_since = 0;
-      const float ON_W = 30.0f;
-      const float OFF_W = 10.0f;
-      const uint32_t ON_MS = 3000;
-      const uint32_t OFF_MS = 5000;
-
-      if (x >= ON_W) {
-        if (on_since == 0) on_since = millis();
-        if (!active && (millis() - on_since >= ON_MS)) {
-          active = true;
-          ESP_LOGI("limiter", "⚡ Charge ON (%.1f W)", x);
-        }
-      } else {
-        on_since = 0;
-      }
-
-      if (x <= OFF_W) {
-        if (off_since == 0) off_since = millis();
-        if (active && (millis() - off_since >= OFF_MS)) {
-          active = false;
-          ESP_LOGI("limiter", "🛑 Charge OFF (%.1f W)", x);
-        }
-      } else {
-        off_since = 0;
-      }
-
-      return active ? x : 0.0f;
+      id(get_shelly_status).execute();  // lance la requête HTTP
+      return id(shelly_power_value);    // dernière valeur connue
 
   # --- Lazy limiter : demande de puissance → consigne courant ---
   - platform: lazy_limiter
@@ -648,6 +643,12 @@ number:
 # === GLOBALS (énergie persistante + timers simples + état)
 # ==========================================================
 globals:
+  # --- Valeur puissance Shelly (mise à jour via script) ---
+  - id: shelly_power_value
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
   - id: api_status
     type: bool
     restore_value: no
@@ -680,12 +681,6 @@ globals:
     restore_value: no
     initial_value: "0"
 
-  # --- Valeur de puissance Shelly (HTTP) ---
-  - id: shelly_power_value
-    type: float
-    restore_value: no
-    initial_value: "0.0"
-
   # --- Machine d'état de charge (0=IDLE,1=BULK,2=ABS,3=FLOAT)
   - id: charge_state
     type: int
@@ -702,23 +697,6 @@ globals:
 # === LOGIQUE AUTONOME + WATCHDOGS
 # ==========================================================
 interval:
-  # 🌐 Shelly polling via HTTP (toutes les 1s)
-  - interval: 1s
-    then:
-      - http_request.get:
-          url: http://192.168.3.38/rpc/shelly.getstatus
-          on_response:
-            then:
-              - lambda: |-
-                  if (status_code == 200) {
-                    json::JsonObject root = json::parse(body);
-                    if (!root.isNull() && root.containsKey("em1:1")) {
-                      auto em = root["em1:1"];
-                      if (em.containsKey("act_power")) {
-                        id(shelly_power_value) = -em["act_power"].as<float>(); // surplus positif
-                      }
-                    }
-                  }
 
   # 🧩 1) Surveillance Modbus DPS5020 — met à jour modbus_ready
   - interval: 5s
