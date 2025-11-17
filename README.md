@@ -6,6 +6,8 @@
 
 ## 📌 Description générale
 
+#### Version Stable OK en Production V1.6.5
+
 Ce projet permet de piloter un système de charge hybride pour batterie **LiFePO₄ 24V / 300Ah** en s'appuyant sur :
 - Le **chargeur solaire Victron** comme source de vérité des phases de charge (Bulk, Absorption, Float),
 - Une alimentation **Emerson/Vertiv R48** (48V) pilotée via **CANBUS**,
@@ -17,6 +19,12 @@ Ce projet permet de piloter un système de charge hybride pour batterie **LiFePO
 🎯 **Objectif :** exploiter le surplus photovoltaïque et automatiser la charge de la batterie tout en garantissant la sécurité, l'efficacité et la compatibilité avec Victron.
 
 ---
+
+Version en cours de Test :
+
+- 1.7.5 => ameliorations - securité et stabilité En cours de test 
+
+- V 2.0 => on change de composant pour le emerson R48 par celui de Sebby et ces amélioration.
 
 ## ⚙️ Fonctionnalités principales
 
