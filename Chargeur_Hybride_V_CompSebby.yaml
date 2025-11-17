@@ -27,7 +27,7 @@
 # ==========================================================
 
 substitutions:
-  device_description: "Chargeur 2.0 LiFePO4 24V 300Ah via DPS5020 (piloté Victron) - Sebby "
+  device_description: "Chargeur 2.0.0 LiFePO4 24V 300Ah via DPS5020 (piloté Victron) - Sebby "
   limiter_name: limiter
   tx_pin: GPIO17
   rx_pin: GPIO16
@@ -39,7 +39,7 @@ substitutions:
 
 esphome:
   name: charger-hybrid
-  friendly_name: "Chargeur 2.0 Hybride Emerson + DPS5020 (Victron/shelly) - sebby "
+  friendly_name: "Chargeur 2.0.0 Hybride Emerson + DPS5020 (Victron/shelly) - sebby "
   min_version: 2024.6.0
   comment: "R48 alimente le DPS5020 (charge LiFePO4 24V, mode piloté Victron, DPS -0.2V)"
   on_boot:
