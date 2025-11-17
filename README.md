@@ -6,7 +6,7 @@
 
 ## 📌 Description générale
 
-#### Version Stable OK en Production V1.6.5
+#### Version Stable OK en Production V1.6.5 ==> Charger_Hybride_Ha_Victron_shelly.yaml
 
 Ce projet permet de piloter un système de charge hybride pour batterie **LiFePO₄ 24V / 300Ah** en s'appuyant sur :
 - Le **chargeur solaire Victron** comme source de vérité des phases de charge (Bulk, Absorption, Float),
