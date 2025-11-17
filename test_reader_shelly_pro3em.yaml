@@ -1,0 +1,51 @@
+esphome:
+  name: shelly_em_reader
+  friendly_name: Shelly EM Reader
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf  # ou "arduino" si tu préfères
+
+wifi:
+  ssid: "TonSSID"
+  password: "TonMotDePasse"
+
+logger:
+
+http_request:
+  useragent: esphome/shelly_reader
+  timeout: 10s
+  verify_ssl: false
+
+sensor:
+  - platform: template
+    name: "Shelly EM1:1 Active Power"
+    id: shelly_em12_power
+    unit_of_measurement: "W"
+    accuracy_decimals: 1
+    update_interval: 30s
+    lambda: |-
+      id(get_shelly_status).execute();
+      return NAN;
+
+script:
+  - id: get_shelly_status
+    then:
+      - http_request.get:
+          url: http://192.168.3.38/rpc/shelly.getstatus
+          
+          on_response:
+            then:
+              - lambda: |-
+                  // Ici, 'body' est déjà passé en paramètre par ESPHome
+                  if (body.empty()) return;
+
+                  auto doc = json::parse_json(body);
+                  if (!doc.isNull()) {
+                    JsonObject root = doc.as<JsonObject>();
+                    if (root["em1:1"].is<JsonObject>()) {
+                      float val = root["em1:1"]["act_power"] | 0.0;
+                      id(shelly_em12_power).publish_state(val);
+                    }
+                  }
