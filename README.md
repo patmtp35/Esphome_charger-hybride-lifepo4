@@ -11,7 +11,8 @@ Version en cours de Test :
 - V 2.0 => on change de composant pour le emerson R48 par celui de Sebby et ces améliorations.
 
 
-## 🟦 Version stable : **1.8.1A (2025)**
+## 🟦 Version stable : **1.8.2 (2025)**
+## 1.6.5 version simpliste mais OK
 Nouvelle architecture sécurisée, modulaire, entièrement configurable via Substitutions.
 
 ⚠ IMPORTANT :
