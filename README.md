@@ -27,7 +27,7 @@ Ce projet pilote un système hybride de charge pour batterie LiFePO₄ 24V / 300
 - Lazy Limiter
 - Home Assistant (optionnel)
 
-## 🆕 Nouveautés majeures en 1.8.1A
+## 🆕 Nouveautés majeures en 1.8.2
 - Comparaison Victron directe
 - Énergie réelle Wh / kWh
 - Watchdogs améliorés
