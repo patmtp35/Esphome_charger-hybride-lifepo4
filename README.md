@@ -8,7 +8,7 @@ Version en cours de Test :
 
 - 1.8.2 => ameliorations - securité et stabilité En cours de test 
 
-- V 2.0 => on change de composant pour le emerson R48 par celui de Sebby et ces amélioration.
+- V 2.0 => on change de composant pour le emerson R48 par celui de Sebby et ces améliorations.
 
 
 ## 🟦 Version stable : **1.8.1A (2025)**
