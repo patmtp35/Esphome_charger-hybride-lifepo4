@@ -63,6 +63,7 @@ ESP32, Victron SmartSolar, R48, DPS5020, Batterie LiFePO4 24V, Shelly EM.
 syssi/esphome-dps  
 jon7119/esphomeemerson-vertiv-r48  
 IxioJo/esphome-emerson-vertiv-r48  
+https://github.com/SeByDocKy/myESPhome
 
 ## 📜 Licence
 MIT
