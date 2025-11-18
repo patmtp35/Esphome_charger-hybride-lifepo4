@@ -11,8 +11,8 @@ Version en cours de Test :
 - V 2.0 => on change de composant pour le emerson R48 par celui de Sebby et ces améliorations.
 - 
 ## 🟦 1.6.6 version Autonome sans HA tout dans l'esp32
-## 🟦 1.6.5 version simpliste mais OK
-## 🟦 Version stable : **1.8.2 (2025)**
+## 🟦 1.6.5 version simpliste mais OK (HA + Victron + Shelly)
+## 🟦 Version stable : **1.8.2 (2025)** (HA + Victron + Shelly)
 Nouvelle architecture sécurisée, modulaire, entièrement configurable via Substitutions.
 
 ⚠ IMPORTANT :
