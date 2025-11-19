@@ -12,7 +12,7 @@ Version en cours de Test :
 - 
 ## 🟦 1.6.6 version Autonome sans HA tout dans l'esp32
 ## 🟦 1.6.5 version simpliste mais OK (HA + Victron + Shelly)
-## 🟦 Version stable : **1.8.2 (2025)** (HA + Victron + Shelly)
+## 🟦 Version en test : **1.8.2 (2025)** (HA + Victron + Shelly)
 Nouvelle architecture sécurisée, modulaire, entièrement configurable via Substitutions.
 
 ⚠ IMPORTANT :
