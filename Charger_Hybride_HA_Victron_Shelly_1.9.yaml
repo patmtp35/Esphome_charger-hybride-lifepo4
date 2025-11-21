@@ -6,6 +6,7 @@
 #   Profil : Ultra lisible, robuste, orienté debug
 #
 #   Philosophie :
+#     - Optimisation du plafond a 500w
 #     - Victron = source de vérité (sensor.smartsolar1_esp_charging_mode)
 #     - DPS n’est autorisé à charger que si Victron est en : bulk / absorption / float
 #     - R48 AC UNIQUEMENT ON si Victron OK (hors mode forcé)
@@ -19,7 +20,7 @@
 #     - ESP32 DevKit
 #     - Emerson / Vertiv R48-3000 (CAN MCP2515 8 MHz)
 #     - DPS5020 (Modbus RTU via UART)
-#
+#     - ne pas oublier de blinder le cable de com Esp - dps
 # ==========================================================
 
 substitutions:
@@ -52,10 +53,10 @@ substitutions:
   min_power_demand: "50"
   max_power_demand: "500"
   limiter_buffer: "30"
-  limiter_update_interval: "3s"
+  limiter_update_interval: "5s"
 
   # ===== Globals =====
-  modbus_ready_delay: "300"         # ms – délai mini entre commandes DPS
+  modbus_ready_delay: "600"         # ms – délai mini entre commandes DPS
   force_charge_mode_default: "false"
   api_status_default: "false"
   last_error_default: '"Aucune erreur"'
@@ -929,22 +930,24 @@ interval:
             target = V_IDLE;
           }
 
-          // 3) Slew-rate 0.1 V
+          // 3) Slew-rate accéléré (0.3 V par cycle)
           static bool init = false;
           static float last = 0.0f;
+
           if (!init) {
             if (id(dps_voltage_sensor).has_state() && id(dps_voltage_sensor).state > 1.0f)
               last = id(dps_voltage_sensor).state;
             else if (id(dps_output_voltage).has_state() && id(dps_output_voltage).state > 1.0f)
               last = id(dps_output_voltage).state;
             else
-              last = V_FLOAT;
+              last = target;
             init = true;
           }
 
           float vset = target;
-          if (fabsf(target - last) > 0.1f) {
-            float step = (target > last) ? 0.1f : -0.1f;
+          const float SLEW_STEP = 0.3f;     // <<< nouveau slew-rate
+          if (fabsf(target - last) > SLEW_STEP) {
+            float step = (target > last) ? SLEW_STEP : -SLEW_STEP;
             vset = last + step;
           }
 
@@ -1004,13 +1007,12 @@ interval:
 
           id(dps_energy_wh).publish_state(id(energy_wh));
 
-  # ------------------- WATCHDOG MODBUS INTELLIGENT (corrigé 100% compatible) -------------------
+  # ------------------- WATCHDOG MODBUS INTELLIGENT (optimisé pour plateau 500 W) -------------------
   - interval: ${watchdog_modbus_interval}
     then:
       - lambda: |-
           // Watchdog MODBUS intelligent basé sur la puissance réelle
-          // → S'active uniquement si le DPS charge vraiment
-          // → Jamais en FLOAT, jamais à vide, jamais sur demande 0 W
+          // Ajusté pour reconnaître les micro-variations du DPS à 500 W
 
           static int freeze_count = 0;
           static float last_v = 0.0f;
@@ -1032,23 +1034,23 @@ interval:
 
           bool updated = false;
 
-          // 3) Variation tension
+          // 3) Variation tension (seuil réduit)
           if (id(dps_output_voltage).has_state() &&
-              fabsf(id(dps_output_voltage).state - last_v) > 0.03f) {
+              fabsf(id(dps_output_voltage).state - last_v) > 0.005f) {
             last_v = id(dps_output_voltage).state;
             updated = true;
           }
 
-          // 4) Variation courant
+          // 4) Variation courant (seuil réduit)
           if (id(dps_output_current).has_state() &&
-              fabsf(id(dps_output_current).state - last_i) > 0.05f) {
+              fabsf(id(dps_output_current).state - last_i) > 0.02f) {
             last_i = id(dps_output_current).state;
             updated = true;
           }
 
-          // 5) Variation puissance
+          // 5) Variation puissance (seuil réduit)
           if (id(dps_output_power).has_state() &&
-              fabsf(id(dps_output_power).state - last_p) > 0.5f) {
+              fabsf(id(dps_output_power).state - last_p) > 0.2f) {
             last_p = id(dps_output_power).state;
             updated = true;
           }
@@ -1065,9 +1067,12 @@ interval:
           // 8) 3 cycles consécutifs sans variation → reset Modbus
           if (freeze_count >= 3) {
             ESP_LOGW("modbus", "freeze DPS (3 cycles sans update) → reset Modbus");
+
             freeze_count = 0;
             id(modbus_ready) = false;
+
             delay(1000);
+
             id(modbus_ready) = true;
           }
 
