@@ -10,6 +10,7 @@
 ### 🟧 1.9.1-H (2025) – Version hybride optimisée (EN TEST)
 Fusion entre la stabilité de la 1.6.5 et la protection complète de la 1.8.x  
 + Correctifs Modbus, watchdogs avancés, logique Victron améliorée, compatibilité HA totale.
++ ne pas oublier de blindé ou bloc de ferite pour le cable de com esp32-dps
 
 ### 🟦 1.8.x – Améliorations sécurité (bus instable sur longues sessions)
 ### 🟩 1.6.6 – Version autonome (sans Home Assistant)
