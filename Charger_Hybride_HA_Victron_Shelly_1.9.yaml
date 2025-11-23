@@ -6,6 +6,7 @@
 #   Profil : Ultra lisible, robuste, orienté debug
 #
 #   Philosophie :
+#     - Ajustement
 #     - Optimisation du plafond a 500w
 #     - Victron = source de vérité (sensor.smartsolar1_esp_charging_mode)
 #     - DPS n’est autorisé à charger que si Victron est en : bulk / absorption / float
