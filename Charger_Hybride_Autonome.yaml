@@ -179,22 +179,38 @@ script:
     mode: restart
     then:
       - http_request.get:
-          url: http://192.168.3.38/rpc/shelly.getstatus
+          url: http://192.168.3.38/status   # Shelly EM Gen1
+          request_headers:
+            Content-Type: application/json
+          capture_response: true
+          max_response_buffer_size: 2048
+          
           on_response:
             then:
               - lambda: |-
-                  if (body.empty()) return;
-                  auto doc = json::parse_json(body);
-                  if (doc.isNull()) return;
+                  if (body.empty()) {
+                    ESP_LOGW("shelly", "Réponse vide");
+                    return;
+                  }
 
-                  JsonObject root = doc.as<JsonObject>();
-                  if (root["em1:1"].is<JsonObject>()) {
-                    float val = root["em1:1"]["act_power"] | 0.0;
-                    // Inversion possible si besoin Shelly renvoie négatif en injection PV
-                    // val = -val;
-                    id(shelly_power_value) = val;
-                    ESP_LOGD("shelly", "Puissance Shelly EM = %.1f W", val);
-                  }  
+                  json::parse_json(body, [](JsonObject root) -> bool {
+
+                    // ===== Shelly EM Gen1 (/status) =====
+                    if (root.containsKey("meters") && root["meters"][0].is<JsonObject>()) {
+                      float val = root["meters"][0]["power"] | 0.0f;
+
+                      // Option inversion si besoin (PV en négatif)
+                      // val = -val;
+
+                      id(shelly_power_value) = val;
+                      ESP_LOGD("shelly", "Shelly EM Gen1 power = %.1f W", val);
+                      return true;
+                    }
+
+                    ESP_LOGW("shelly", "Format JSON inconnu");
+                    return false;
+                  });
+  
   - id: start_sequence
     mode: queued
     then:
