@@ -2,11 +2,15 @@
 #   PROJET : Chargeur hybride LiFePO₄ 24V 300Ah (Optimisé Victron)
 #   Chaîne : AC → Emerson/Vertiv R48 (48V) → DPS5020 → Batterie
 #
-#   Version : 1.9.1-H (Hybride 1.6.5 + 1.8.x, dépôt jon7119)
+#   Version : 1.9.2 (Hybride 1.6.5 + 1.8.x, dépôt jon7119)
 #   Profil : Ultra lisible, robuste, orienté debug
 #
+#   changelog:
+#   1.9.2:   
+#   - patch LOGIQUE VICRON + TENSION DPS + ÉNERGIE  
+#   1.9.1-h:
+#
 #   Philosophie :
-#     - Ajustement
 #     - Optimisation du plafond a 500w
 #     - Victron = source de vérité (sensor.smartsolar1_esp_charging_mode)
 #     - DPS n’est autorisé à charger que si Victron est en : bulk / absorption / float
@@ -26,7 +30,7 @@
 
 substitutions:
   # ===== Général =====
-  device_description: "Chargeur 1.9.1-H LiFePO4 24V 300Ah via DPS5020 (piloté Victron)"
+  device_description: "Chargeur 1.9.2 LiFePO4 24V 300Ah via DPS5020 (piloté Victron)"
   limiter_name: limiter
   tx_pin: GPIO17
   rx_pin: GPIO16
@@ -51,7 +55,7 @@ substitutions:
 
   # ===== Lazy Limiter =====
   power_sensor_inactivity_timeout: "20s"
-  min_power_demand: "50"
+  min_power_demand: "40"
   max_power_demand: "500"
   limiter_buffer: "30"
   limiter_update_interval: "5s"
@@ -809,7 +813,7 @@ switch:
     dc_sw:
       id: emerson_r48_dc_sw
       name: "R48 DC switch STOP"
-      restore_mode: ALWAYS_ON
+      restore_mode: RESTORE_DEFAULT_OFF
     fan_sw:
       id: emerson_r48_fan_sw
       name: "R48 FAN MAX"
@@ -929,6 +933,13 @@ interval:
             else if (mode == "float")      target = V_FLOAT;
           } else {
             target = V_IDLE;
+          }
+          
+          // --- PATCH DEMARRAGE COURANT DPS ---
+          if (victron_ok &&
+              id(dps_output_voltage).has_state() &&
+              id(dps_output_voltage).state > target - 0.2f) {
+            target = id(dps_output_voltage).state + 0.4f;
           }
 
           // 3) Slew-rate accéléré (0.3 V par cycle)
